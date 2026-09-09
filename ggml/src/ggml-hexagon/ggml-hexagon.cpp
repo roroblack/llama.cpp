@@ -82,7 +82,7 @@ static int    opt_arch    = 0; // autodetect
 static size_t opt_ndev    = 1;
 static size_t opt_nhvx    = 0; // use all
 static int    opt_nhmx    = 1; // when set, enable HMX; when 0, use HVX only
-static bool   opt_nhmx_explicit = false; // GGML_HEXAGON_NHMX was set by hand: skip the arch gate
+static bool   opt_nhmx_diag     = false; // GGML_HEXAGON_NHMX >= 2 selects a diagnostic mode: skip the arch gate
 static size_t opt_vmem    = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
 static size_t opt_mbuf    = 1ul * 1024 * 1024 * 1024; // max buffer size
 static int    opt_etm     = 0;
@@ -3207,10 +3207,10 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             //
             // An explicit GGML_HEXAGON_NHMX overrides this gate, which is how the fp16 HMX
             // diagnostics (NHMX=2..6, see htp/hmx-utils.h) reach a v73 part.
-            // The gate below is a default, not a hardware fact. An explicit
-            // GGML_HEXAGON_NHMX is a deliberate request to run HMX anyway, which is
-            // what the fp16 HMX diagnostics (NHMX=2..5) need on a v73 part.
-            const bool hmx_arch_ok = (opt_arch >= 75) || opt_nhmx_explicit;
+            // Only the diagnostic modes bypass the gate. GGML_HEXAGON_NHMX=1 is an
+            // ordinary user setting and must keep the workaround; letting it through
+            // would quietly re-enable the failing path this gate exists to avoid.
+            const bool hmx_arch_ok = (opt_arch >= 75) || opt_nhmx_diag;
             this->n_hmx     = (opt_nhmx != 0 && hmx_arch_ok) ? (uint32_t)hw_n_hmx : 0;
             if (opt_nhmx != 0 && !hmx_arch_ok && hw_n_hmx) {
                 GGML_LOG_WARN("ggml-hex: HMX disabled on Hexagon v%d (fp16 HMX unusable below v75)
@@ -3224,7 +3224,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             GGML_LOG_WARN("ggml-hex: %s failed to query hwinfo (0x%x), using defaults\n", this->c_name(), hw_err);
             this->n_threads = opt_nhvx > 0 ? (uint32_t)opt_nhvx : 8;
             this->n_hvx     = opt_nhvx > 0 ? (uint32_t)opt_nhvx : 8;
-            this->n_hmx     = (opt_nhmx != 0 && (opt_arch >= 75 || opt_nhmx_explicit)) ? 1 : 0;
+            this->n_hmx     = (opt_nhmx != 0 && (opt_arch >= 75 || opt_nhmx_diag)) ? 1 : 0;
             this->vtcm_size = 8 * 1024 * 1024;
         }
     }
@@ -4368,9 +4368,26 @@ static int64_t ggml_hexagon_mul_mat_chunk_rows(const struct ggml_hexagon_session
     // Largest fitting size wins. Not monotone at the low end (<= 4 rows switches
     // the kernel to 16-deep weight prefetch, which grows src0 again), so take the
     // first size that fits going down rather than assuming a clean boundary.
+    //
+    // The tail matters for the same reason: a chunk size that fits can still leave a
+    // remainder of 1..4 rows, and that remainder is laid out with the deeper prefetch.
+    // Accept a size only when the remainder fits too.
     for (int64_t c = nrows / 2; c >= 1; c /= 2) {
-        if (ggml_hexagon_mul_mat_rows_fit(sess, src0, src1, dst, c, &kparams)) {
-            return c;
+        if (!ggml_hexagon_mul_mat_rows_fit(sess, src0, src1, dst, c, &kparams)) {
+            continue;
+        }
+        // Even out the split: with k = ceil(nrows/c) chunks, ceil(nrows/k) rows each is
+        // no larger than c and leaves the smallest possible tail, which keeps the last
+        // chunk away from the <= 4 row regime that switches to the deeper prefetch.
+        const int64_t k        = (nrows + c - 1) / c;
+        const int64_t balanced = (nrows + k - 1) / k;
+        const int64_t tail     = nrows % balanced;
+
+        if (!ggml_hexagon_mul_mat_rows_fit(sess, src0, src1, dst, balanced, &kparams)) {
+            continue;
+        }
+        if (tail == 0 || ggml_hexagon_mul_mat_rows_fit(sess, src0, src1, dst, tail, &kparams)) {
+            return balanced;
         }
     }
 
@@ -6545,7 +6562,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
-    opt_nhmx_explicit = (str_nhmx != NULL) && (opt_nhmx != 0);
+    opt_nhmx_diag = (str_nhmx != NULL) && (opt_nhmx >= 2);
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_mm_chunk  = str_mm_chunk  ? atoi(str_mm_chunk)                    : opt_mm_chunk;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;

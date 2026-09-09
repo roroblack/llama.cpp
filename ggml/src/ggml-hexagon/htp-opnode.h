@@ -44,8 +44,24 @@ struct htp_opnode {
         if (!chunked) {
             return;
         }
-        chunk_src1->data = (char *) chunk_parent_src1->data + chunk_row_first * chunk_parent_src1->nb[1];
-        chunk_dst->data  = (char *) chunk_parent_dst->data  + chunk_row_first * chunk_parent_dst->nb[1];
+        // Refresh the allocation metadata too, not just the address. add_tensor() computes
+        // the DSP-side offset as (data - buffer->base()) and reads ->extra, so a chunk view
+        // carrying a new address next to a stale buffer would hand the DSP a bogus offset.
+        refresh_chunk_view(chunk_src1, chunk_parent_src1);
+        refresh_chunk_view(chunk_dst,  chunk_parent_dst);
+    }
+
+    void refresh_chunk_view(ggml_tensor * view, const ggml_tensor * parent) {
+        view->buffer = parent->buffer;
+        view->extra  = parent->extra;
+        view->type   = parent->type;
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            view->nb[i] = parent->nb[i];
+        }
+        view->ne[0] = parent->ne[0];
+        view->ne[2] = parent->ne[2];
+        view->ne[3] = parent->ne[3];
+        view->data  = (char *) parent->data + chunk_row_first * parent->nb[1];
     }
 
     int n_active_src(const ggml_tensor * t) const {
