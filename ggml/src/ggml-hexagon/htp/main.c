@@ -326,6 +326,13 @@ uint32_t htp_hmx_probe = 0;
 //
 // Reported through htp_iface_hwinfo(), which the host calls again after
 // htp_iface_start() so it sees a verdict rather than a default.
+#define HTP_HMX_PROBE_NOT_RUN   0u
+#define HTP_HMX_PROBE_PASS      1u
+#define HTP_HMX_PROBE_WRONG     2u
+#define HTP_HMX_PROBE_NO_RESOURCE 3u
+
+// Only the value hwinfo reports before any session exists. The real verdict
+// lives on the context.
 uint32_t htp_hmx_verified = 1;
 
 struct htp_hmx_selftest {
@@ -334,7 +341,9 @@ struct htp_hmx_selftest {
 };
 
 static void htp_hmx_selftest_fn(void * data) {
-    // Runs on the HMX queue thread, the thread that holds the HMX lock.
+    // Runs inline on the RPC thread that is starting the session, with the HMX
+    // lock already taken by the caller. That is not the production worker, so a
+    // pass here does not prove the worker context also works.
     struct htp_hmx_selftest * a = (struct htp_hmx_selftest *) data;
 
     __fp16 *   act  = (__fp16 *)  (a->vtcm + 0);
@@ -360,11 +369,17 @@ static void htp_hmx_selftest_fn(void * data) {
                  :: "r"(act), "r"(wgt), "r"(2047) : "memory");
     asm volatile("mxmem(%0, %1):after.hf = acc\n" :: "r"(out), "r"(0) : "memory");
 
-    // a row of 32 ones dotted with a column of 32 ones is 32.0, which is 0x5000
+    // Every element is a row of 32 ones dotted with a column of 32 ones, so every
+    // element must be exactly 32.0 (0x5000). Checking a couple of them would pass
+    // a unit that is wrong in the other 1022.
     const uint16_t * o = (const uint16_t *) out;
-    a->ok = (o[0] == 0x5000) && (o[1] == 0x5000);
-    FARF(ALWAYS, "hmx-selftest: got %04x %04x (want 5000) -> %s",
-         o[0], o[1], a->ok ? "HMX usable" : "HMX wrong, falling back to HVX");
+    int bad = 0;
+    for (int i = 0; i < 1024; i++) {
+        if (o[i] != 0x5000) { bad++; }
+    }
+    a->ok = (bad == 0);
+    FARF(ALWAYS, "hmx-selftest: %d/1024 wrong, first %04x %04x (want 5000) -> %s",
+         bad, o[0], o[1], a->ok ? "HMX usable" : "HMX wrong, falling back to HVX");
 }
 
 AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
@@ -580,7 +595,10 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         void * hmx_ptr = (void *) ((uintptr_t) block + offset_hmx);
         ctx->hmx_queue = hmx_queue_init(hmx_ptr, HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE, ctx->vtcm_rctx, &ctx->trace[HTP_MAX_NTHREADS]);
     }
-    if (ctx->hmx_enabled && ctx->vtcm_base) {
+    ctx->hmx_probe_status = HTP_HMX_PROBE_NOT_RUN;
+    // 3 tiles of 2048 plus a 256-byte bias, and the bias must land 256-aligned.
+    if (ctx->hmx_enabled && ctx->vtcm_base && ctx->vtcm_size >= 8192 &&
+        (((uintptr_t) ctx->vtcm_base) % 256u) == 0u) {
         // Inline, on this thread: the queue thread cannot take the HMX lock this
         // early (the runtime reports "failed 1, holder 0x0") and the instructions
         // then fault instead of returning a value.
@@ -592,15 +610,15 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         if (lrc == AEE_SUCCESS) {
             htp_hmx_selftest_fn(&st);
             HAP_compute_res_hmx_unlock(ctx->vtcm_rctx);
-            htp_hmx_verified = st.ok ? 1 : 0;
+            ctx->hmx_probe_status = st.ok ? HTP_HMX_PROBE_PASS : HTP_HMX_PROBE_WRONG;
         } else {
             // Could not run the test. That is not evidence that HMX is broken, so
             // leave the decision to whatever policy the caller already has.
-            FARF(ALWAYS, "hmx-selftest: could not lock HMX (rc %d); verdict unknown", lrc);
-            htp_hmx_verified = 1;
+            FARF(ALWAYS, "hmx-selftest: could not lock HMX (rc %d); not run", lrc);
+            ctx->hmx_probe_status = HTP_HMX_PROBE_NO_RESOURCE;
         }
         vtcm_release(ctx);
-        if (!htp_hmx_verified) {
+        if (ctx->hmx_probe_status == HTP_HMX_PROBE_WRONG) {
             ctx->hmx_enabled = 0;
         }
     }
@@ -708,7 +726,6 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
 }
 
 AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_t * n_hvx, uint32_t * n_hmx, uint64_t * vtcm_size) {
-    (void)handle;
     if (!n_threads || !n_hvx || !n_hmx || !vtcm_size) {
         return AEE_EBADPARM;
     }
@@ -728,7 +745,14 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     // for now we force n_threads == n_hvx
     *n_threads = n_hvx_val;
     *n_hvx     = n_hvx_val;
-    *n_hmx     = htp_hmx_verified;   // 1 until a session proves otherwise
+    // Report this handle's verdict when it has one. Before a session has run the
+    // probe there is nothing measured to report, so fall back to the default.
+    struct htp_handle * hh = (struct htp_handle *) handle;
+    if (hh && hh->ctx && hh->ctx->hmx_probe_status != HTP_HMX_PROBE_NOT_RUN) {
+        *n_hmx = (hh->ctx->hmx_probe_status == HTP_HMX_PROBE_WRONG) ? 0 : 1;
+    } else {
+        *n_hmx = htp_hmx_verified;
+    }
 
     uint32_t vtcm_sz = 8 * 1024 * 1024; // 8MB default fallback
     HAP_compute_res_query_VTCM(0, (unsigned int *)&vtcm_sz, NULL, NULL, NULL);

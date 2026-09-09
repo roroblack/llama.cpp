@@ -86,6 +86,10 @@ struct htp_context {
     int                    thread_prio;
 
     bool                   hmx_enabled;
+    // 0 = not run, 1 = computed the right answer, 2 = computed the wrong one,
+    // 3 = could not be run. Kept per session: several sessions share one loaded
+    // library, so a global would let one read another session's verdict.
+    uint32_t               hmx_probe_status;
     bool                   etm;
     uint32_t               profiler;
     struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];

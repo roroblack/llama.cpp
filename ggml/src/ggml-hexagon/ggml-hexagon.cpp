@@ -3177,6 +3177,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     this->valid_handle = true;
 
     // Query HW info and resolve session options
+    bool hw_has_hmx = false;   // what the hardware claimed, before any probe
     this->max_bufsize = opt_mbuf;
     {
         unsigned int hw_n_threads = 0;
@@ -3224,6 +3225,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
                 GGML_LOG_WARN("ggml-hex: HMX disabled on Hexagon v%d (fp16 HMX unusable below v75)
 ", opt_arch);
             }
+            hw_has_hmx      = (hw_n_hmx != 0);
             this->vtcm_size = (uint64_t)hw_vtcm_size;
             GGML_LOG_INFO("ggml-hex: %s hwinfo: threads %u, hvx %u, hmx %u, vtcm %llu MB\n",
                           this->c_name(), this->n_threads, this->n_hvx, this->n_hmx,
@@ -3304,16 +3306,25 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     }
     this->valid_iface = true;
 
-    // Ask again now that the session has run its HMX self test. Before start the
-    // answer is only a default; after it, n_hmx says whether the unit really
-    // computed 32.0 rather than whether the arch number looks new enough.
-    if (this->n_hmx) {
+    // Ask again now that the session has run its HMX self test. Before start the answer
+    // is only a default; after it, n_hmx says whether the unit really computed 32.0.
+    //
+    // This overrides the architecture gate in both directions on purpose. Clearing it
+    // alone would leave a v73 part whose HMX does work stuck on HVX, which is the case
+    // the arch gate was only ever standing in for.
+    {
         unsigned int v_threads = 0, v_hvx = 0, v_hmx = 0;
         unsigned long long v_vtcm = 0;
-        if (htp_iface_hwinfo(this->handle, &v_threads, &v_hvx, &v_hmx, &v_vtcm) == 0 && v_hmx == 0) {
-            GGML_LOG_WARN("ggml-hex: %s HMX self test failed (wrong results); using HVX\n",
-                          this->c_name());
-            this->n_hmx = 0;
+        if (htp_iface_hwinfo(this->handle, &v_threads, &v_hvx, &v_hmx, &v_vtcm) == 0) {
+            if (this->n_hmx && v_hmx == 0) {
+                GGML_LOG_WARN("ggml-hex: %s HMX self test computed the wrong answer; using HVX\n",
+                              this->c_name());
+                this->n_hmx = 0;
+            } else if (!this->n_hmx && v_hmx != 0 && opt_nhmx != 0 && hw_has_hmx) {
+                GGML_LOG_INFO("ggml-hex: %s HMX self test passed on v%d; enabling HMX\n",
+                              this->c_name(), opt_arch);
+                this->n_hmx = 1;
+            }
         }
     }
 
