@@ -9,7 +9,7 @@ Build: `cmake --preset arm64-android-snapdragon-release`, `ghcr.io/snapdragon-to
 
 ---
 
-## 1. Hexagon: HMX returns zero on this device, and the silicon is not the reason
+## 1. Hexagon: HMX returns zero on this device
 
 `test-backend-ops test -b HTP0 -o MUL_MAT`: **514 pass / 556** with HMX on, **556/556**
 with it off. Every extra failure is an op that took the `hmx-tiled` path.
@@ -45,6 +45,12 @@ sequence -- `bias = mxmem2` / `mxclracc.hf` / `{activation.hf ; weight.hf}` /
 Qualcomm's `hmx_hexagon_protos.h` agrees: every `.hf` HMX intrinsic sits outside all
 `__HMX_ARCH__` guards, so from v68 up. What `__HMX_ARCH__ >= 73` adds is the split store
 `cvt.hf=acc` / `mxmem(Rs,Rt)=cvt`.
+
+Note what this does and does not establish. It removes "the ISA does not have this" and
+"fp16 HMX arrived after v73" as explanations. It does **not** clear this chip: a simulator
+validates a model, not this part's fuses, stepping, power state, firmware or access
+controls. A silicon erratum, an SKU restriction, a missing execution-state initialisation
+and a real-hardware ordering requirement absent from the model all remain open.
 
 Feeding that same known-good data (1.0 x 1.0) through the *device's* kernel still returns
 zero, so it is not the operands or their layout either.
