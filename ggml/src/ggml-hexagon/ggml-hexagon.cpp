@@ -3187,6 +3187,14 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         if (hw_err == 0) {
             this->n_threads = opt_nhvx > 0 ? (uint32_t)opt_nhvx : (uint32_t)hw_n_threads;
             this->n_hvx     = opt_nhvx > 0 ? (uint32_t)opt_nhvx : (uint32_t)hw_n_hvx;
+            // Default policy only. The real decision is made at run time: the DSP
+            // multiplies a tile of 1.0 by a tile of 1.0 during htp_iface_start and the
+            // host re-reads n_hmx below, so a part where HMX silently returns zeros is
+            // caught by measurement rather than by its architecture number.
+            //
+            // Kept as a fallback because the self test cannot always run (it needs the
+            // compute resource acquired), and because it is what was measured here.
+            //
             // WORKAROUND, and the cause is still open.
             //
             // What is measured: with HMX on, every op that takes the hmx-tiled path fails
@@ -3295,6 +3303,19 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         throw std::runtime_error("ggml-hex: iface start failed (see log for details)");
     }
     this->valid_iface = true;
+
+    // Ask again now that the session has run its HMX self test. Before start the
+    // answer is only a default; after it, n_hmx says whether the unit really
+    // computed 32.0 rather than whether the arch number looks new enough.
+    if (this->n_hmx) {
+        unsigned int v_threads = 0, v_hvx = 0, v_hmx = 0;
+        unsigned long long v_vtcm = 0;
+        if (htp_iface_hwinfo(this->handle, &v_threads, &v_hvx, &v_hmx, &v_vtcm) == 0 && v_hmx == 0) {
+            GGML_LOG_WARN("ggml-hex: %s HMX self test failed (wrong results); using HVX\n",
+                          this->c_name());
+            this->n_hmx = 0;
+        }
+    }
 
     if (opt_profile) {
         htp_iface_pmu_conf pmu_conf{};

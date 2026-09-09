@@ -14,6 +14,7 @@
 #include <HAP_ps.h>
 #include <HAP_dcvs.h>
 #include <qurt.h>
+#include <qurt_timer.h>
 #include <qurt_thread.h>
 #include <qurt_memory.h>
 #include <remote.h>
@@ -320,6 +321,52 @@ static void htp_error_callback(dspqueue_t queue, int error, void * context);
 
 uint32_t htp_hmx_probe = 0;
 
+
+// --- HMX runtime self test -------------------------------------------------
+//
+// Reported through htp_iface_hwinfo(), which the host calls again after
+// htp_iface_start() so it sees a verdict rather than a default.
+uint32_t htp_hmx_verified = 1;
+
+struct htp_hmx_selftest {
+    uint8_t * vtcm;
+    volatile int ok;
+};
+
+static void htp_hmx_selftest_fn(void * data) {
+    // Runs on the HMX queue thread, the thread that holds the HMX lock.
+    struct htp_hmx_selftest * a = (struct htp_hmx_selftest *) data;
+
+    __fp16 *   act  = (__fp16 *)  (a->vtcm + 0);
+    __fp16 *   wgt  = (__fp16 *)  (a->vtcm + 2048);
+    __fp16 *   out  = (__fp16 *)  (a->vtcm + 4096);
+    uint32_t * bias = (uint32_t *) (a->vtcm + 6144);   // 256-byte aligned
+
+    for (int i = 0; i < 1024; i++) {
+        act[i] = (__fp16) 1.0f;
+        wgt[i] = (__fp16) 1.0f;
+        out[i] = (__fp16) -1.0f;          // so an untouched output is visible
+    }
+    // documented identity bias: 32 words of fp16 1.0, then 32 zero words
+    for (int i = 0;  i < 32; i++) { bias[i] = 0x00003c00u; }
+    for (int i = 32; i < 64; i++) { bias[i] = 0u; }
+
+    asm volatile("bias = mxmem2(%0)\n" :: "r"(bias) : "memory");
+    asm volatile("mxclracc.hf\n" ::: "memory");
+    asm volatile("{\n"
+                 "  activation.hf = mxmem(%0, %2):deep\n"
+                 "  weight.hf     = mxmem(%1, %2)\n"
+                 "}\n"
+                 :: "r"(act), "r"(wgt), "r"(2047) : "memory");
+    asm volatile("mxmem(%0, %1):after.hf = acc\n" :: "r"(out), "r"(0) : "memory");
+
+    // a row of 32 ones dotted with a column of 32 ones is 32.0, which is 0x5000
+    const uint16_t * o = (const uint16_t *) out;
+    a->ok = (o[0] == 0x5000) && (o[1] == 0x5000);
+    FARF(ALWAYS, "hmx-selftest: got %04x %04x (want 5000) -> %s",
+         o[0], o[1], a->ok ? "HMX usable" : "HMX wrong, falling back to HVX");
+}
+
 AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
@@ -533,6 +580,31 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         void * hmx_ptr = (void *) ((uintptr_t) block + offset_hmx);
         ctx->hmx_queue = hmx_queue_init(hmx_ptr, HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE, ctx->vtcm_rctx, &ctx->trace[HTP_MAX_NTHREADS]);
     }
+    if (ctx->hmx_enabled && ctx->vtcm_base) {
+        // Inline, on this thread: the queue thread cannot take the HMX lock this
+        // early (the runtime reports "failed 1, holder 0x0") and the instructions
+        // then fault instead of returning a value.
+        struct htp_hmx_selftest st = { (uint8_t *) ctx->vtcm_base, 0 };
+        // The selftest needs the resource actively acquired, exactly as the kernels do.
+        // Without this the HMX lock reports "failed 1, holder 0x0" at session start.
+        vtcm_acquire(ctx);
+        int lrc = HAP_compute_res_hmx_lock(ctx->vtcm_rctx);
+        if (lrc == AEE_SUCCESS) {
+            htp_hmx_selftest_fn(&st);
+            HAP_compute_res_hmx_unlock(ctx->vtcm_rctx);
+            htp_hmx_verified = st.ok ? 1 : 0;
+        } else {
+            // Could not run the test. That is not evidence that HMX is broken, so
+            // leave the decision to whatever policy the caller already has.
+            FARF(ALWAYS, "hmx-selftest: could not lock HMX (rc %d); verdict unknown", lrc);
+            htp_hmx_verified = 1;
+        }
+        vtcm_release(ctx);
+        if (!htp_hmx_verified) {
+            ctx->hmx_enabled = 0;
+        }
+    }
+
     FARF(HIGH, "HMX %s (n_hmx=%d probe=%u)", ctx->hmx_enabled ? "enabled" : "disabled", n_hmx, htp_hmx_probe);
 
     ctx->n_threads = n_hvx;
@@ -656,7 +728,7 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     // for now we force n_threads == n_hvx
     *n_threads = n_hvx_val;
     *n_hvx     = n_hvx_val;
-    *n_hmx     = 1;
+    *n_hmx     = htp_hmx_verified;   // 1 until a session proves otherwise
 
     uint32_t vtcm_sz = 8 * 1024 * 1024; // 8MB default fallback
     HAP_compute_res_query_VTCM(0, (unsigned int *)&vtcm_sz, NULL, NULL, NULL);
