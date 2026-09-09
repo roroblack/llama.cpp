@@ -28,6 +28,26 @@ struct htp_opnode {
     std::vector<const ggml_tensor *> outputs;
     std::string                      name;
 
+    // n-chunking: this node computes rows [chunk_row_first, +ne[1]) of a larger
+    // MUL_MAT whose full activation block does not fit VTCM. chunk_src1/chunk_dst
+    // point into `dummy` and their data pointers are re-derived from the parents
+    // at enqueue time, because a cached graph replays the same opnodes while the
+    // allocator may have moved the parent tensors underneath.
+    bool                chunked           { false };
+    int64_t             chunk_row_first   { 0 };
+    ggml_tensor *       chunk_src1        { nullptr };
+    ggml_tensor *       chunk_dst         { nullptr };
+    const ggml_tensor * chunk_parent_src1 { nullptr };
+    const ggml_tensor * chunk_parent_dst  { nullptr };
+
+    void refresh_chunk() {
+        if (!chunked) {
+            return;
+        }
+        chunk_src1->data = (char *) chunk_parent_src1->data + chunk_row_first * chunk_parent_src1->nb[1];
+        chunk_dst->data  = (char *) chunk_parent_dst->data  + chunk_row_first * chunk_parent_dst->nb[1];
+    }
+
     int n_active_src(const ggml_tensor * t) const {
         if (!t) return 0;
         for (int i = GGML_MAX_SRC - 1; i >= 0; i--) {

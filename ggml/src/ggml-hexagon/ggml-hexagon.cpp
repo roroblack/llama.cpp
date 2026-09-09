@@ -90,6 +90,7 @@ static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static bool   opt_hostbuf = false;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
+static int    opt_mm_chunk  = 1; // split a MUL_MAT whose activation block exceeds VTCM into row chunks (0 = refuse instead)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
@@ -2513,6 +2514,10 @@ struct ggml_hexagon_opbatch {
 
     bool try_fuse(const htp_opnode & node) {
         if (!opt_opfusion) return false;
+        // A chunked MUL_MAT covers only part of dst. Fusing a bias ADD into the
+        // last chunk, or stacking chunks into MUL_MAT_NX, would silently drop the
+        // other chunks, so keep chunked nodes out of every fusion path.
+        if (node.chunked || (n_ops > 0 && ops[n_ops - 1].chunked)) return false;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul(node))  return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
@@ -4287,6 +4292,73 @@ static bool ggml_hexagon_tensor_is_non_host(const struct ggml_hexagon_session * 
     GGML_UNUSED(sess);
 }
 
+// --- MUL_MAT n-chunking ----------------------------------------------------
+//
+// The HVX matmul kernels stage the whole src1 (activation) block in VTCM, so the
+// working set grows linearly with the number of activation rows while VTCM is a
+// fixed 8 MB. A 512-row prefill matmul overshoots it by 2x..27x (measured on
+// SM8735), and supports_op() used to answer no in that case. That answer is not
+// local to prefill: llama-model-loader.cpp probes weight placement with a
+// hardcoded n=512, so a weight rejected there is pinned to the CPU for *every*
+// later use, n=1 decode included -- 686 MiB of gemma-3n-E2B ended up on the CPU
+// that way even though the DSP handles those same matmuls fine at n=1.
+//
+// So instead of refusing, split along src1 rows. Chunk c reads rows
+// [first, first+rows) of src1 and writes the same rows of dst; the arithmetic is
+// unchanged because each output row depends only on its own activation row.
+
+static bool ggml_hexagon_mul_mat_rows_fit(const struct ggml_hexagon_session * sess,
+                                          const struct ggml_tensor *          src0,
+                                          const struct ggml_tensor *          src1,
+                                          const struct ggml_tensor *          dst,
+                                          int64_t                             nrows,
+                                          struct htp_mm_kernel_params *       kparams) {
+    // Shape-only copies: precompute reads ne/nb/type/op, never ->data.
+    struct ggml_tensor s1 = *src1;
+    struct ggml_tensor d  = *dst;
+    s1.ne[1] = nrows;
+    d.ne[1]  = nrows;
+
+    ggml_hexagon_precompute_matmul_params(sess, src0, &s1, &d, kparams);
+
+    return (size_t) kparams->vtcm_size <= sess->vtcm_size;
+}
+
+// Rows of src1 per DSP op: src1->ne[1] when the op already fits, a smaller
+// power-of-two split when it does not, 0 when not even one row fits.
+static int64_t ggml_hexagon_mul_mat_chunk_rows(const struct ggml_hexagon_session * sess,
+                                               const struct ggml_tensor *          src0,
+                                               const struct ggml_tensor *          src1,
+                                               const struct ggml_tensor *          dst) {
+    struct htp_mm_kernel_params kparams;
+
+    const int64_t nrows = src1->ne[1];
+
+    if (ggml_hexagon_mul_mat_rows_fit(sess, src0, src1, dst, nrows, &kparams)) {
+        return nrows;
+    }
+
+    if (!opt_mm_chunk || nrows < 2) {
+        return 0;
+    }
+
+    // Slicing happens on dim 1 only, so refuse batched/broadcast shapes.
+    if (src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return 0;
+    }
+
+    // Largest fitting size wins. Not monotone at the low end (<= 4 rows switches
+    // the kernel to 16-deep weight prefetch, which grows src0 again), so take the
+    // first size that fits going down rather than assuming a clean boundary.
+    for (int64_t c = nrows / 2; c >= 1; c /= 2) {
+        if (ggml_hexagon_mul_mat_rows_fit(sess, src0, src1, dst, c, &kparams)) {
+            return c;
+        }
+    }
+
+    return 0;
+}
+
 static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -4343,11 +4415,14 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
             return false;
     }
 
-    struct htp_mm_kernel_params kparams;
-    ggml_hexagon_precompute_matmul_params(sess, src0, src1, dst, &kparams);
-    if ((size_t)kparams.vtcm_size > sess->vtcm_size) {
-        HEX_VERBOSE("ggml-hex: %s supported MUL_MAT VTCM size needed (%d) > budget (%zu)\n", sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
+    const int64_t chunk_rows = ggml_hexagon_mul_mat_chunk_rows(sess, src0, src1, dst);
+    if (chunk_rows == 0) {
+        HEX_VERBOSE("ggml-hex: %s supported MUL_MAT does not fit VTCM budget (%zu) at any chunk size\n", sess->c_name(), sess->vtcm_size);
         return false;
+    }
+    if (chunk_rows < src1->ne[1]) {
+        HEX_VERBOSE("ggml-hex: %s supported MUL_MAT %d rows will be chunked by %d to fit VTCM budget (%zu)\n",
+                    sess->c_name(), (int) src1->ne[1], (int) chunk_rows, sess->vtcm_size);
     }
 
     return true;
@@ -5151,12 +5226,64 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
     return true;
 }
 
+// Emit one opnode per row chunk of a MUL_MAT that does not fit VTCM whole.
+// Returns false when no split is needed or possible; the caller then emits the
+// op unchanged.
+static bool ggml_hexagon_emit_mul_mat_chunks(const struct ggml_hexagon_session * sess,
+                                             ggml_tensor *                       n,
+                                             std::vector<htp_opnode> &           out) {
+    ggml_tensor * src0 = n->src[0];
+    ggml_tensor * src1 = n->src[1];
+
+    const int64_t nrows = src1->ne[1];
+    const int64_t chunk = ggml_hexagon_mul_mat_chunk_rows(sess, src0, src1, n);
+
+    if (chunk <= 0 || chunk >= nrows) {
+        return false;
+    }
+
+    HEX_VERBOSE("ggml-hex: %s chunk MUL_MAT %s : %d rows -> %d ops of %d rows\n",
+                sess->c_name(), n->name, (int) nrows, (int) ((nrows + chunk - 1) / chunk), (int) chunk);
+
+    for (int64_t first = 0; first < nrows; first += chunk) {
+        const int64_t rows = (chunk < nrows - first) ? chunk : (nrows - first);
+
+        htp_opnode node(HTP_OP_MUL_MAT, nullptr);
+
+        ggml_tensor * d  = node.add_dummy(*n);
+        ggml_tensor * s1 = node.add_dummy(*src1);
+
+        d->ne[1]  = rows;
+        s1->ne[1] = rows;
+        d->data   = (char *) n->data    + first * n->nb[1];
+        s1->data  = (char *) src1->data + first * src1->nb[1];
+        d->src[0] = src0;
+        d->src[1] = s1;
+
+        node.init(d);
+
+        node.chunked           = true;
+        node.chunk_row_first   = first;
+        node.chunk_src1        = s1;
+        node.chunk_dst         = d;
+        node.chunk_parent_src1 = src1;
+        node.chunk_parent_dst  = n;
+
+        ggml_hexagon_precompute_matmul_params(sess, src0, s1, d,
+            (struct htp_mm_kernel_params *) node.kernel_params);
+
+        out.push_back(std::move(node));
+    }
+
+    return true;
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
-    const std::vector<htp_opnode> * nodes_ptr = nullptr;
+    std::vector<htp_opnode> * nodes_ptr = nullptr;
     std::vector<htp_opnode> computed_nodes;
 
     // Check for cache hit
@@ -5189,6 +5316,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
             htp_opnode node(HTP_OP_INVALID, n);
             node.opcode = op_remap_to_htp(n);
+            if (node.opcode == HTP_OP_MUL_MAT &&
+                ggml_hexagon_emit_mul_mat_chunks(sess, n, computed_nodes)) {
+                continue;
+            }
             if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
                 ggml_hexagon_precompute_matmul_params(sess,
                     node.node->src[0], node.node->src[1], node.node,
@@ -5231,7 +5362,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     }
 
     // Queue and execute
-    for (const auto & node : *nodes_ptr) {
+    for (auto & node : *nodes_ptr) {
+        // Cached graphs replay the same opnodes; re-derive the chunk views in
+        // case the allocator moved the parent tensors since they were built.
+        node.refresh_chunk();
         sess->enqueue_op(node);
     }
 
@@ -6343,6 +6477,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_nhvx     = getenv("GGML_HEXAGON_NHVX");
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
+    const char * str_mm_chunk  = getenv("GGML_HEXAGON_MM_CHUNK");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
@@ -6393,6 +6528,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
+    opt_mm_chunk  = str_mm_chunk  ? atoi(str_mm_chunk)                    : opt_mm_chunk;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
