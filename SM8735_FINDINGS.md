@@ -9,76 +9,96 @@ Build: `cmake --preset arm64-android-snapdragon-release`, `ghcr.io/snapdragon-to
 
 ---
 
-## 1. Hexagon: the fp16 HMX path is wrong on this v73 part (cause still open)
+## 1. Hexagon: HMX returns zero on this device, and the silicon is not the reason
 
-`test-backend-ops test -b HTP0 -o MUL_MAT` -> **514 pass / 44 fail**, every failure `ERR = inf`.
+`test-backend-ops test -b HTP0 -o MUL_MAT`: **514 pass / 556** with HMX on, **556/556**
+with it off. Every extra failure is an op that took the `hmx-tiled` path.
 
-Correlating the kernel path from `GGML_HEXAGON_VERBOSE=1` against pass/fail over the
-whole sweep gives an exact 1:1:
+### The failures are zeros, not infinities
 
-| | count |
-|---|---:|
-| ops that took `hmx-tiled` | **42** |
-| ops that failed with `ERR = inf` | **42** |
-| any other failure | 0 |
+The test reports `ERR = inf`, which is not the same as the tensor containing infinities.
+With DSP-side logging enabled (see below), the actual values are:
 
-The 42 include two `f16` ops, so this is not specific to the repacked quantized types.
+```
+hmx-dbg in : act 350c bb4f 356b b5e8 | wgt 37f7 b3f7 8000 b3fd | scale 3c00 0000
+hmx-dbg out: vtcm 0000 0000 0000 0000 0000 0000
+hmx-dbg dst: rows 5 cols 32 dstcols 16 stride 16 | 00000000 00000000 00000000 00000000
+```
 
-`GGML_HEXAGON_NHMX=0` (or `GGML_HEXAGON_MM_SELECT<=2`) -> **554/554 pass**, and real
-model output becomes correct. Failures begin exactly at `m > HTP_MM_HMX_MIN_NROWS` (= 4),
-i.e. as soon as the HMX path is selected, which is why 1B models appear to work while
-larger ones emit garbage.
+**1857 of 1857 HMX outputs are exactly zero.** The operands arriving at the kernel are
+ordinary fp16 values and the bias is the documented identity (32 words of `0x3c00`, then
+32 zero words). The `inf` comes from the error metric dividing by an all-zero result.
 
-### Two readings of this that were wrong
+### The instruction sequence is correct on v73
 
-Both are recorded because both would close the door on a fixable bug.
+Booting the SDK's QuRT image for v73 under `hexagon-sim` and running the kernel's exact
+sequence -- `bias = mxmem2` / `mxclracc.hf` / `{activation.hf ; weight.hf}` /
+`mxmem(...):after.hf = acc` -- on a tile of 1.0 times a tile of 1.0:
 
-**"v73 cannot execute fp16 HMX."** Qualcomm's own `hmx_hexagon_protos.h` (Hexagon SDK
-6.6.0.0, tools 19.0.07) places every `.hf` HMX intrinsic -- `mxclracc.hf`,
-`activation.hf=mxmem`, `weight.hf=mxmem`, `mxmem(Rs,Rt):after.hf=acc`, `mxswapacc.hf` --
-**outside every `__HMX_ARCH__` guard**, i.e. available from v68 up. The intrinsics that
-are gated at `__HMX_ARCH__ >= 73` are the *split* output path (`cvt.hf=acc(Rs)` then
-`mxmem(Rs,Rt)=cvt`) and the 4-bit `weight.n` loads. So fp16 HMX is not a v75 feature, and
-v73 is the version that *adds* the split store.
+| dot tiles | expected | simulated v73 |
+|---:|---:|---|
+| 1 | 32 | 32.00, 1024/1024 |
+| 2 | 64 | 64.00, 1024/1024 |
+| 4 | 128 | 128.00, 1024/1024 |
+| 8 (what the device uses) | 256 | 256.00, 1024/1024 |
 
-**"Zeroing every HMX input still yields inf, so the unit does not compute."** That
-experiment zeroed the bias along with the activations and weights, but the documented
-identity bias is 32 words of `0x3c00` followed by 32 zero words (which is exactly what
-`hmx_init_column_scales(..., Q6_V_vsplat_R(0x3c00))` writes in normal operation). A zero
-scale is not identity, so the output was undefined by construction. Separately, the
-activation/weight/bias load asm blocks carry no `"memory"` clobber, so the compiler was
-free to move the zeroing past the HMX reads; it is not established that the inputs were
-zero when the unit read them. The experiment proves nothing either way.
+Qualcomm's `hmx_hexagon_protos.h` agrees: every `.hf` HMX intrinsic sits outside all
+`__HMX_ARCH__` guards, so from v68 up. What `__HMX_ARCH__ >= 73` adds is the split store
+`cvt.hf=acc` / `mxmem(Rs,Rt)=cvt`.
 
-`ERR = inf` from `test-backend-ops` is also not proof that the output tensor contains
-infinities -- the error metric itself can overflow. The raw output values have not been
-inspected yet.
+Feeding that same known-good data (1.0 x 1.0) through the *device's* kernel still returns
+zero, so it is not the operands or their layout either.
 
-### What does still hold
+### What has been ruled out, by measurement
 
-Executing `mxclracc.hf` with HMX not enabled raises exception `0x18`, identically on
-simulated v73, v75 and v79, while HVX instructions in the same program execute fine
-(hexagon-sim, standalone). The device does not raise `0x18`; it returns wrong values and
-the DSP thread survives. `htp/hmx-queue.c` ignores the return of
-`HAP_compute_res_hmx_lock()`, so a failed lock would have hit `0x18`. That points to the
-unit being present and enabled -- but the lock's return value should be recorded rather
-than inferred, and that has not been done yet.
+| hypothesis | how it died |
+|---|---|
+| silicon / architecture generation | simulator computes correctly on v73 |
+| resource lock not taken | `HAP_compute_res_hmx_lock` returns 0, 29,265 times |
+| weak symbol resolving to a false success | the wrapper returns `0x80000404` when absent; we get 0 |
+| wrong lock generation | `hmx_lock3`, `hmx_lock4`, `query_capability` all NOT_SUPPORTED here |
+| HMX clock never voted | `HAP_power_set_HMX_v2` is rejected (`0x80000414`); v1 succeeds |
+| VTCM pressure | 43 KB used of 8 MB |
 
-Also note `htp/main.c: htp_iface_hwinfo()` sets `*n_hmx = 1` unconditionally without
-querying anything.
+Also measured: `qurt_hmx_lock` is not exported into this process domain at all (the backend
+requests an unsigned PD), and a hard reference to it stops the skel from loading.
+
+**Not yet tried**: testsig / a signed PD, PMU counters to see whether the unit executes at
+all, the ADSP domain, variations of the v1 `HAP_power_set_HMX` parameters.
+
+### Two earlier readings in this file were wrong
+
+Both are kept because a conclusion that closes a door is worse than no conclusion.
+
+**"v73 cannot execute fp16 HMX."** See above.
+
+**"Zeroing every HMX input still yields inf, so the unit does not compute."** That run
+zeroed the bias too, and a zero scale is not the documented identity, so the output was
+undefined by construction. The load asm also carried no `"memory"` clobber, so the compiler
+was free to move the zeroing past the HMX reads.
 
 ### Change in this branch
 
-`ggml-hexagon.cpp`: keep HMX off below v75. This is a workaround that is measured to
-work, not a claim about the hardware; the comment at the gate says so. An explicit
-`GGML_HEXAGON_NHMX` overrides it.
+`ggml-hexagon.cpp` + `htp/main.c`: decide by running it. During `htp_iface_start` the DSP
+multiplies a tile of 1.0 by a tile of 1.0 and only reports HMX as available if the answer
+is 32.0; `htp_iface_hwinfo()` returns that verdict and the host re-reads it after start.
+Parts where HMX works keep it, including v73 ones.
 
-`htp/hmx-utils.h` + `hmx-mm-kernels-tiled.h`: `GGML_HEXAGON_NHMX` 2..6 select fp16 HMX
-diagnostics on the DSP (the value already travels there as the `n_hmx` argument of
-`htp_iface_start`). Mode 2 runs the real kernel with the v73 split store instead of the
-combined `:after.hf` form -- they are separate encodings, so a part can implement one and
-not the other. Modes 3..6 store the accumulator with no multiply at all to isolate the
-clear and the store. The missing `"memory"` clobbers on the load asm are fixed.
+Two placement mistakes worth knowing: the test cannot run on the HMX queue thread at
+session start (the lock is not available yet, the instructions fault, and the session dies
+with `0x8000040d`), and it must be wrapped in `vtcm_acquire()`/`vtcm_release()` or the lock
+fails with `failed 1, holder 0x0`. A test that could not run must not be reported as a test
+that failed.
+
+The `opt_arch >= 75` gate stays as a fallback for when the self test cannot run.
+
+### Getting DSP logs (both halves are needed)
+
+1. build with `-DGGML_HEXAGON_HTP_DEBUG=ON` (defines `FARF_HIGH=1`)
+2. put a `<process-name>.farf` file containing `0x001f001f001f001f` on `ADSP_LIBRARY_PATH`
+
+FastRPC's `log_config` then enables `adspmsgd` and DSP messages appear in `logcat`. Trying
+either half alone produces nothing, which is why this looked impossible.
 
 ## 2. Hexagon speed after the fix — where the time goes
 
