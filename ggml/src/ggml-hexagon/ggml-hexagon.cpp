@@ -3181,7 +3181,18 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         if (hw_err == 0) {
             this->n_threads = opt_nhvx > 0 ? (uint32_t)opt_nhvx : (uint32_t)hw_n_threads;
             this->n_hvx     = opt_nhvx > 0 ? (uint32_t)opt_nhvx : (uint32_t)hw_n_hvx;
-            this->n_hmx     = (opt_nhmx != 0) ? (uint32_t)hw_n_hmx : 0;
+            // fp16 HMX does not produce arithmetic results on Hexagon v73 silicon:
+            // feeding all-zero activations, weights and bias still yields inf in the
+            // accumulator tile, and every op that takes the HMX path fails
+            // test-backend-ops MUL_MAT with ERR=inf while the HVX paths are correct
+            // (554/554). The assembler encodes the .hf HMX instructions for v68..v81
+            // alike, so this is not caught at build time. Keep HMX off below v75.
+            const bool hmx_arch_ok = (opt_arch >= 75);
+            this->n_hmx     = (opt_nhmx != 0 && hmx_arch_ok) ? (uint32_t)hw_n_hmx : 0;
+            if (opt_nhmx != 0 && !hmx_arch_ok && hw_n_hmx) {
+                GGML_LOG_WARN("ggml-hex: HMX disabled on Hexagon v%d (fp16 HMX unusable below v75)
+", opt_arch);
+            }
             this->vtcm_size = (uint64_t)hw_vtcm_size;
             GGML_LOG_INFO("ggml-hex: %s hwinfo: threads %u, hvx %u, hmx %u, vtcm %llu MB\n",
                           this->c_name(), this->n_threads, this->n_hvx, this->n_hmx,
@@ -3190,7 +3201,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             GGML_LOG_WARN("ggml-hex: %s failed to query hwinfo (0x%x), using defaults\n", this->c_name(), hw_err);
             this->n_threads = opt_nhvx > 0 ? (uint32_t)opt_nhvx : 8;
             this->n_hvx     = opt_nhvx > 0 ? (uint32_t)opt_nhvx : 8;
-            this->n_hmx     = (opt_nhmx != 0) ? 1 : 0;
+            this->n_hmx     = (opt_nhmx != 0 && opt_arch >= 75) ? 1 : 0;
             this->vtcm_size = 8 * 1024 * 1024;
         }
     }
