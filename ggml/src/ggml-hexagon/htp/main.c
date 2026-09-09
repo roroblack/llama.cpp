@@ -318,6 +318,8 @@ static void htp_main_thread(void * context);
 static void htp_packet_callback(dspqueue_t queue, int error, void * context);
 static void htp_error_callback(dspqueue_t queue, int error, void * context);
 
+uint32_t htp_hmx_probe = 0;
+
 AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
@@ -523,13 +525,15 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     }
 #endif
 
-    ctx->hmx_enabled = n_hmx;
+    // n_hmx > 1 selects an HMX diagnostic mode (see htp_hmx_probe_run).
+    htp_hmx_probe    = (n_hmx > 1) ? n_hmx : 0;
+    ctx->hmx_enabled = (n_hmx != 0);
     ctx->hmx_queue   = NULL;
     if (n_hmx) {
         void * hmx_ptr = (void *) ((uintptr_t) block + offset_hmx);
         ctx->hmx_queue = hmx_queue_init(hmx_ptr, HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE, ctx->vtcm_rctx, &ctx->trace[HTP_MAX_NTHREADS]);
     }
-    FARF(HIGH, "HMX %s (n_hmx=%d)", ctx->hmx_enabled ? "enabled" : "disabled", n_hmx);
+    FARF(HIGH, "HMX %s (n_hmx=%d probe=%u)", ctx->hmx_enabled ? "enabled" : "disabled", n_hmx, htp_hmx_probe);
 
     ctx->n_threads = n_hvx;
     ctx->n_threads_div = init_fastdiv_values(ctx->n_threads);

@@ -82,6 +82,7 @@ static int    opt_arch    = 0; // autodetect
 static size_t opt_ndev    = 1;
 static size_t opt_nhvx    = 0; // use all
 static int    opt_nhmx    = 1; // when set, enable HMX; when 0, use HVX only
+static bool   opt_nhmx_explicit = false; // GGML_HEXAGON_NHMX was set by hand: skip the arch gate
 static size_t opt_vmem    = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
 static size_t opt_mbuf    = 1ul * 1024 * 1024 * 1024; // max buffer size
 static int    opt_etm     = 0;
@@ -3186,13 +3187,30 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         if (hw_err == 0) {
             this->n_threads = opt_nhvx > 0 ? (uint32_t)opt_nhvx : (uint32_t)hw_n_threads;
             this->n_hvx     = opt_nhvx > 0 ? (uint32_t)opt_nhvx : (uint32_t)hw_n_hvx;
-            // fp16 HMX does not produce arithmetic results on Hexagon v73 silicon:
-            // feeding all-zero activations, weights and bias still yields inf in the
-            // accumulator tile, and every op that takes the HMX path fails
-            // test-backend-ops MUL_MAT with ERR=inf while the HVX paths are correct
-            // (554/554). The assembler encodes the .hf HMX instructions for v68..v81
-            // alike, so this is not caught at build time. Keep HMX off below v75.
-            const bool hmx_arch_ok = (opt_arch >= 75);
+            // WORKAROUND, and the cause is still open.
+            //
+            // What is measured: with HMX on, every op that takes the hmx-tiled path fails
+            // test-backend-ops MUL_MAT (42 hmx-tiled ops, 42 failures, no others) while the
+            // HVX paths are correct; GGML_HEXAGON_NHMX=0 gives 554/554 and correct model
+            // output. Turning HMX off below v75 is therefore a workaround that works.
+            //
+            // What this is NOT: a statement about the silicon. Two earlier readings here
+            // were wrong and are recorded so they are not repeated.
+            //   * "v73 cannot do fp16 HMX." Qualcomm's own hmx_hexagon_protos.h puts every
+            //     .hf HMX intrinsic outside all __HMX_ARCH__ guards, i.e. from v68 up. What
+            //     v73 actually adds is the split store, cvt.hf=acc / mxmem(Rs,Rt)=cvt.
+            //   * "Zeroing the HMX inputs still yields inf, so the unit does not compute."
+            //     That run also zeroed the bias, but the documented identity bias is 32
+            //     words of 0x3c00 followed by 32 zero words -- a zero scale is not identity.
+            //     The load asm also carried no memory clobber, so the zeroing could have
+            //     been reordered past the HMX reads. The experiment proved nothing.
+            //
+            // An explicit GGML_HEXAGON_NHMX overrides this gate, which is how the fp16 HMX
+            // diagnostics (NHMX=2..6, see htp/hmx-utils.h) reach a v73 part.
+            // The gate below is a default, not a hardware fact. An explicit
+            // GGML_HEXAGON_NHMX is a deliberate request to run HMX anyway, which is
+            // what the fp16 HMX diagnostics (NHMX=2..5) need on a v73 part.
+            const bool hmx_arch_ok = (opt_arch >= 75) || opt_nhmx_explicit;
             this->n_hmx     = (opt_nhmx != 0 && hmx_arch_ok) ? (uint32_t)hw_n_hmx : 0;
             if (opt_nhmx != 0 && !hmx_arch_ok && hw_n_hmx) {
                 GGML_LOG_WARN("ggml-hex: HMX disabled on Hexagon v%d (fp16 HMX unusable below v75)
@@ -3206,7 +3224,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             GGML_LOG_WARN("ggml-hex: %s failed to query hwinfo (0x%x), using defaults\n", this->c_name(), hw_err);
             this->n_threads = opt_nhvx > 0 ? (uint32_t)opt_nhvx : 8;
             this->n_hvx     = opt_nhvx > 0 ? (uint32_t)opt_nhvx : 8;
-            this->n_hmx     = (opt_nhmx != 0 && opt_arch >= 75) ? 1 : 0;
+            this->n_hmx     = (opt_nhmx != 0 && (opt_arch >= 75 || opt_nhmx_explicit)) ? 1 : 0;
             this->vtcm_size = 8 * 1024 * 1024;
         }
     }
@@ -6527,6 +6545,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
+    opt_nhmx_explicit = (str_nhmx != NULL) && (opt_nhmx != 0);
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_mm_chunk  = str_mm_chunk  ? atoi(str_mm_chunk)                    : opt_mm_chunk;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;

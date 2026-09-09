@@ -197,6 +197,10 @@ static inline void hmx_interleave_cols_to_tiles(__fp16 * restrict tiles_out,
     }
 }
 
+// fp16 HMX diagnostic. 0 = normal operation. Set from n_hmx (GGML_HEXAGON_NHMX)
+// in htp_iface_start(); see htp_hmx_probe_run() below.
+extern uint32_t htp_hmx_probe;
+
 // --- HMX inline asm macros for load-store packetization ---
 #define HMX_LOAD_MPY_F16(act, wt, range) \
     "{\n" \
@@ -218,5 +222,52 @@ static inline void hmx_interleave_cols_to_tiles(__fp16 * restrict tiles_out,
 
 #define HMX_CLRACC_F16() \
     "mxclracc.hf\n"
+
+#define HMX_CLRACC_INT() \
+    "mxclracc\n"
+
+// v73+ split form of the output path: convert the accumulator, then store it.
+// The combined mxmem(...):after.hf=acc above does both in one instruction; the
+// two are separate encodings, so a part can implement one and not the other.
+#define HMX_CVT_STORE_F16(out, cvt_reg, store_reg) \
+    "cvt.hf = acc(" cvt_reg ")\n" \
+    "mxmem(" out ", " store_reg ") = cvt\n"
+
+// Write the accumulator out with no multiply at all, so the only thing the
+// stored tile can contain is whatever the clear left behind.
+static inline void htp_hmx_probe_run(__fp16 * out, uint32_t n_row_tiles, uint32_t n_col_tiles,
+                                     uint32_t n_elms_per_tile) {
+    for (uint32_t i = 0; i < n_row_tiles; ++i) {
+        __fp16 * tile = out + (size_t) i * n_col_tiles * n_elms_per_tile;
+        for (uint32_t j = 0; j < n_col_tiles; ++j) {
+            switch (htp_hmx_probe) {
+                case 5:  break;                              // deliberately no clear
+                case 6:  asm volatile(HMX_CLRACC_INT()); break;
+                default: asm volatile(HMX_CLRACC_F16()); break;
+            }
+
+            if (htp_hmx_probe == 4) {
+                asm volatile(HMX_CVT_STORE_F16("%0", "%1", "%2")
+                             : : "r"(tile), "r"(2), "r"(0) : "memory");
+            } else {
+                asm volatile(HMX_STORE_AFTER_F16("%0", "%1")
+                             : : "r"(tile), "r"(0) : "memory");
+            }
+            tile += n_elms_per_tile;
+        }
+    }
+}
+
+// Output path used by the real kernels. Mode 2 swaps in the v73 split store so the
+// combined and split encodings can be compared on the same silicon and the same data.
+static inline void htp_hmx_store_tile(__fp16 * tile) {
+    if (htp_hmx_probe == 2) {
+        asm volatile(HMX_CVT_STORE_F16("%0", "%1", "%2")
+                     : : "r"(tile), "r"(2), "r"(0) : "memory");
+    } else {
+        asm volatile(HMX_STORE_AFTER_F16("%0", "%1")
+                     : : "r"(tile), "r"(0) : "memory");
+    }
+}
 
 #endif // HMX_UTILS_H

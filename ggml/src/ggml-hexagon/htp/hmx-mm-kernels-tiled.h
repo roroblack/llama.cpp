@@ -608,7 +608,12 @@ static void core_dot_chunk_fp16_short(__fp16 *restrict output, const __fp16 *res
     __builtin_assume(n_dot_tiles > 0);
     __builtin_assume(n_dot_tiles <= 32);
 
-    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)scales));
+    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)scales) : "memory");
+
+    if (htp_hmx_probe >= 3) {
+        htp_hmx_probe_run(output, n_row_tiles, n_col_tiles, HTP_MM_HMX_TILE_N_ELMS);
+        return;
+    }
 
     const size_t dot_stride = n_dot_tiles * HTP_MM_HMX_TILE_N_ELMS;
     const uint32_t range = 2048u * n_dot_tiles - 1;
@@ -620,8 +625,8 @@ static void core_dot_chunk_fp16_short(__fp16 *restrict output, const __fp16 *res
 
         for (size_t c = 0; c < n_col_tiles; ++c) {
             asm volatile(HMX_CLRACC_F16());
-            asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(row_base), "r"(col_base));
-            asm volatile(HMX_STORE_AFTER_F16("%0", "%1") : : "r"(out_tile), "r"(0) : "memory");
+            asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(row_base), "r"(col_base) : "memory");
+            htp_hmx_store_tile(out_tile);
             col_base += dot_stride;
             out_tile += HTP_MM_HMX_TILE_N_ELMS;
         }
@@ -639,7 +644,7 @@ static void core_dot_chunk_fp16(__fp16 *restrict output, const __fp16 *restrict 
     __builtin_assume(n_col_tiles > 0);
     __builtin_assume(n_dot_tiles > 32);
 
-    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)scales));
+    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)scales) : "memory");
 
     const size_t dot_stride = n_dot_tiles * HTP_MM_HMX_TILE_N_ELMS;
 
@@ -658,17 +663,17 @@ static void core_dot_chunk_fp16(__fp16 *restrict output, const __fp16 *restrict 
             const uint32_t rem = n_dot_tiles % 32;
 
             for (uint32_t l = 0; l < n_loops; ++l) {
-                asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(65535), "r"(row_tiles), "r"(col_tiles));
+                asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(65535), "r"(row_tiles), "r"(col_tiles) : "memory");
                 row_tiles += 32 * HTP_MM_HMX_TILE_N_ELMS;
                 col_tiles += 32 * HTP_MM_HMX_TILE_N_ELMS;
             }
 
             if (rem > 0) {
                 const uint32_t range = 2048u * rem - 1;
-                asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(row_tiles), "r"(col_tiles));
+                asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(row_tiles), "r"(col_tiles) : "memory");
             }
 
-            asm volatile(HMX_STORE_AFTER_F16("%0", "%1") : : "r"(out_tile), "r"(0) : "memory");
+            htp_hmx_store_tile(out_tile);
 
             col_base += dot_stride;
             out_tile += HTP_MM_HMX_TILE_N_ELMS;
@@ -684,7 +689,12 @@ static void core_mma_chunk_fp16_short(__fp16 *restrict c, const __fp16 *restrict
     __builtin_assume(n_dot_tiles > 0);
     __builtin_assume(n_dot_tiles <= 32);
 
-    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)col_scales));
+    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)col_scales) : "memory");
+
+    if (htp_hmx_probe >= 3) {
+        htp_hmx_probe_run(c, n_row_tiles, n_col_tiles, HTP_MM_HMX_TILE_N_ELMS);
+        return;
+    }
 
     const size_t dot_tile_stride = n_dot_tiles * HTP_MM_HMX_TILE_N_ELMS;
     const uint32_t range = 2048u * n_dot_tiles - 1;
@@ -699,12 +709,12 @@ static void core_mma_chunk_fp16_short(__fp16 *restrict c, const __fp16 *restrict
             asm volatile(HMX_CLRACC_F16());
 
             if (!zero_init) {
-                asm volatile(HMX_LOAD_MPY_F16("%1", "%2", "%0") : : "r"(2047), "r"(accum_tile), "r"(eye_tile));
+                asm volatile(HMX_LOAD_MPY_F16("%1", "%2", "%0") : : "r"(2047), "r"(accum_tile), "r"(eye_tile) : "memory");
             }
 
-            asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(row_base), "r"(col_base));
+            asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(row_base), "r"(col_base) : "memory");
 
-            asm volatile(HMX_STORE_AFTER_F16("%0", "%1") : : "r"(accum_tile), "r"(0) : "memory");
+            htp_hmx_store_tile(accum_tile);
 
             col_base   += dot_tile_stride;
             accum_tile += HTP_MM_HMX_TILE_N_ELMS;
@@ -723,7 +733,7 @@ static void core_mma_chunk_fp16(__fp16 *restrict c, const __fp16 *restrict a, co
     __builtin_assume(n_col_tiles > 0);
     __builtin_assume(n_dot_tiles > 32);
 
-    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)col_scales));
+    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)col_scales) : "memory");
 
     const size_t dot_tile_stride = n_dot_tiles * HTP_MM_HMX_TILE_N_ELMS;
 
@@ -740,24 +750,24 @@ static void core_mma_chunk_fp16(__fp16 *restrict c, const __fp16 *restrict a, co
             asm volatile(HMX_CLRACC_F16());
 
             if (!zero_init) {
-                asm volatile(HMX_LOAD_MPY_F16("%1", "%2", "%0") : : "r"(2047), "r"(accum_tile), "r"(eye_tile));
+                asm volatile(HMX_LOAD_MPY_F16("%1", "%2", "%0") : : "r"(2047), "r"(accum_tile), "r"(eye_tile) : "memory");
             }
 
             const uint32_t n_loops = n_dot_tiles / 32;
             const uint32_t rem = n_dot_tiles % 32;
 
             for (uint32_t l = 0; l < n_loops; ++l) {
-                asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(65535), "r"(row_tiles), "r"(col_tiles));
+                asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(65535), "r"(row_tiles), "r"(col_tiles) : "memory");
                 row_tiles += 32 * HTP_MM_HMX_TILE_N_ELMS;
                 col_tiles += 32 * HTP_MM_HMX_TILE_N_ELMS;
             }
 
             if (rem > 0) {
                 const uint32_t range = 2048u * rem - 1;
-                asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(row_tiles), "r"(col_tiles));
+                asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(row_tiles), "r"(col_tiles) : "memory");
             }
 
-            asm volatile(HMX_STORE_AFTER_F16("%0", "%1") : : "r"(accum_tile), "r"(0) : "memory");
+            htp_hmx_store_tile(accum_tile);
 
             col_base += dot_tile_stride;
             accum_tile += HTP_MM_HMX_TILE_N_ELMS;

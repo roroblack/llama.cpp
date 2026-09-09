@@ -9,9 +9,9 @@ Build: `cmake --preset arm64-android-snapdragon-release`, `ghcr.io/snapdragon-to
 
 ---
 
-## 1. Hexagon: fp16 HMX produces no arithmetic result on v73
+## 1. Hexagon: the fp16 HMX path is wrong on this v73 part (cause still open)
 
-`test-backend-ops test -b HTP0 -o MUL_MAT` → **514 pass / 44 fail**, every failure `ERR = inf`.
+`test-backend-ops test -b HTP0 -o MUL_MAT` -> **514 pass / 44 fail**, every failure `ERR = inf`.
 
 Correlating the kernel path from `GGML_HEXAGON_VERBOSE=1` against pass/fail over the
 whole sweep gives an exact 1:1:
@@ -22,44 +22,63 @@ whole sweep gives an exact 1:1:
 | ops that failed with `ERR = inf` | **42** |
 | any other failure | 0 |
 
-The 42 include two `f16` ops, so this is not specific to the repacked quantized types —
-**everything that reaches HMX is wrong.** The passing `f16`/`f32` ops all took `hvx-tiled`.
+The 42 include two `f16` ops, so this is not specific to the repacked quantized types.
 
-`GGML_HEXAGON_NHMX=0` (or `GGML_HEXAGON_MM_SELECT<=2`) → **554/554 pass**, and real
-model output becomes correct.
+`GGML_HEXAGON_NHMX=0` (or `GGML_HEXAGON_MM_SELECT<=2`) -> **554/554 pass**, and real
+model output becomes correct. Failures begin exactly at `m > HTP_MM_HMX_MIN_NROWS` (= 4),
+i.e. as soon as the HMX path is selected, which is why 1B models appear to work while
+larger ones emit garbage.
 
-### The decisive experiment
+### Two readings of this that were wrong
 
-Patched `core_mma_chunk_fp16` / `core_mma_chunk_fp16_short` to zero **all** HMX inputs
-(activations `a`, weights `b`, bias `col_scales`) before the asm block, then reran the
-single failing case:
+Both are recorded because both would close the door on a fixable bug.
 
-```
-type_a=q4_0,type_b=f32,m=16,n=5,k=256   ->   ERR = inf
-```
+**"v73 cannot execute fp16 HMX."** Qualcomm's own `hmx_hexagon_protos.h` (Hexagon SDK
+6.6.0.0, tools 19.0.07) places every `.hf` HMX intrinsic -- `mxclracc.hf`,
+`activation.hf=mxmem`, `weight.hf=mxmem`, `mxmem(Rs,Rt):after.hf=acc`, `mxswapacc.hf` --
+**outside every `__HMX_ARCH__` guard**, i.e. available from v68 up. The intrinsics that
+are gated at `__HMX_ARCH__ >= 73` are the *split* output path (`cvt.hf=acc(Rs)` then
+`mxmem(Rs,Rt)=cvt`) and the 4-bit `weight.n` loads. So fp16 HMX is not a v75 feature, and
+v73 is the version that *adds* the split store.
 
-`0 x 0 + 0` must be `0`. Getting `inf` means the fp16 HMX sequence
-(`mxclracc.hf` / `activation.hf = mxmem(...)` / `mxmem(...):after.hf = acc`)
-does not compute on this silicon.
+**"Zeroing every HMX input still yields inf, so the unit does not compute."** That
+experiment zeroed the bias along with the activations and weights, but the documented
+identity bias is 32 words of `0x3c00` followed by 32 zero words (which is exactly what
+`hmx_init_column_scales(..., Q6_V_vsplat_R(0x3c00))` writes in normal operation). A zero
+scale is not identity, so the output was undefined by construction. Separately, the
+activation/weight/bias load asm blocks carry no `"memory"` clobber, so the compiler was
+free to move the zeroing past the HMX reads; it is not established that the inputs were
+zero when the unit read them. The experiment proves nothing either way.
 
-The assembler is not a guard here — `hexagon-clang -mv68 -mhmx` through `-mv81 -mhmx`
-all accept the `.hf` HMX encodings, including v68 which predates fp16 HMX entirely.
+`ERR = inf` from `test-backend-ops` is also not proof that the output tensor contains
+infinities -- the error metric itself can overflow. The raw output values have not been
+inspected yet.
+
+### What does still hold
+
+Executing `mxclracc.hf` with HMX not enabled raises exception `0x18`, identically on
+simulated v73, v75 and v79, while HVX instructions in the same program execute fine
+(hexagon-sim, standalone). The device does not raise `0x18`; it returns wrong values and
+the DSP thread survives. `htp/hmx-queue.c` ignores the return of
+`HAP_compute_res_hmx_lock()`, so a failed lock would have hit `0x18`. That points to the
+unit being present and enabled -- but the lock's return value should be recorded rather
+than inferred, and that has not been done yet.
 
 Also note `htp/main.c: htp_iface_hwinfo()` sets `*n_hmx = 1` unconditionally without
 querying anything.
 
-### Threshold
-
-Failures begin exactly at `m > HTP_MM_HMX_MIN_NROWS` (= 4), i.e. as soon as the HMX
-path is selected. `m <= 4` (decode) always passes, which is why 1B models appear to work
-while larger ones emit garbage.
-
 ### Change in this branch
 
-`ggml-hexagon.cpp`: keep HMX off below v75. Not proposed as the right upstream fix —
-a runtime self-test would be better, and v75+ was never verified here (no such device).
+`ggml-hexagon.cpp`: keep HMX off below v75. This is a workaround that is measured to
+work, not a claim about the hardware; the comment at the gate says so. An explicit
+`GGML_HEXAGON_NHMX` overrides it.
 
----
+`htp/hmx-utils.h` + `hmx-mm-kernels-tiled.h`: `GGML_HEXAGON_NHMX` 2..6 select fp16 HMX
+diagnostics on the DSP (the value already travels there as the `n_hmx` argument of
+`htp_iface_start`). Mode 2 runs the real kernel with the v73 split store instead of the
+combined `:after.hf` form -- they are separate encodings, so a part can implement one and
+not the other. Modes 3..6 store the accumulator with no multiply at all to isolate the
+clear and the store. The missing `"memory"` clobbers on the load asm are fixed.
 
 ## 2. Hexagon speed after the fix — where the time goes
 
