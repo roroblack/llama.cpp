@@ -91,7 +91,15 @@ static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static bool   opt_hostbuf = false;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
-static int    opt_mm_chunk  = 1; // split a MUL_MAT whose activation block exceeds VTCM into row chunks (0 = refuse instead)
+static int    opt_mm_chunk  = 2; // 0 = refuse a MUL_MAT whose activation block exceeds VTCM,
+                                 // 1 = split it into row chunks that fit,
+                                 // 2 = split it into row chunks that keep the TILED kernel.
+                                 //     Mode 1 rarely fires: precompute already falls back to the
+                                 //     flat kernel when tiled does not fit, and flat fits, so
+                                 //     "does it fit" answers yes at full row count.
+                                 //     Measured pp512 on SM8735 at ubatch 256:
+                                 //     mode 1 18.68 +/- 0.63 t/s, mode 2 31.42 +/- 1.01.
+                                 //     MUL_MAT stays 556/556 either way.
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
@@ -4377,6 +4385,21 @@ static bool ggml_hexagon_mul_mat_rows_fit(const struct ggml_hexagon_session * se
     return (size_t) kparams->vtcm_size <= sess->vtcm_size;
 }
 
+// Fits VTCM *and* keeps the tiled quantized kernel. Plain rows_fit() cannot tell those
+// apart: precompute_matmul_params silently downgrades to HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT
+// when the tiled layout is too big, and reports the flat size, which fits.
+static bool ggml_hexagon_mul_mat_rows_tiled(const struct ggml_hexagon_session * sess,
+                                            const struct ggml_tensor *          src0,
+                                            const struct ggml_tensor *          src1,
+                                            const struct ggml_tensor *          dst,
+                                            int64_t                             nrows,
+                                            struct htp_mm_kernel_params *       kparams) {
+    if (!ggml_hexagon_mul_mat_rows_fit(sess, src0, src1, dst, nrows, kparams)) {
+        return false;
+    }
+    return kparams->kernel_type != HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
+}
+
 // Rows of src1 per DSP op: src1->ne[1] when the op already fits, a smaller
 // power-of-two split when it does not, 0 when not even one row fits.
 static int64_t ggml_hexagon_mul_mat_chunk_rows(const struct ggml_hexagon_session * sess,
@@ -4387,6 +4410,35 @@ static int64_t ggml_hexagon_mul_mat_chunk_rows(const struct ggml_hexagon_session
 
     const int64_t nrows = src1->ne[1];
 
+    // Slicing happens on dim 1 only, so batched/broadcast shapes are never chunked.
+    const bool sliceable = (src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                            dst->ne[2] == 1 && dst->ne[3] == 1);
+
+    if (opt_mm_chunk >= 2 && nrows >= 2 && sliceable) {
+        // Largest row count that still gets the tiled kernel. c == nrows means no split.
+        for (int64_t c = nrows; c >= 1; c /= 2) {
+            if (!ggml_hexagon_mul_mat_rows_tiled(sess, src0, src1, dst, c, &kparams)) {
+                continue;
+            }
+            const int64_t k        = (nrows + c - 1) / c;
+            const int64_t balanced = (nrows + k - 1) / k;
+            const int64_t tail     = nrows % balanced;
+            if (!ggml_hexagon_mul_mat_rows_tiled(sess, src0, src1, dst, balanced, &kparams)) {
+                continue;
+            }
+            if (tail != 0 &&
+                !ggml_hexagon_mul_mat_rows_tiled(sess, src0, src1, dst, tail, &kparams)) {
+                continue;
+            }
+            if (balanced < nrows) {
+                HEX_VERBOSE("ggml-hex: %s MUL_MAT %d rows -> %d to keep the tiled kernel\n",
+                            sess->c_name(), (int) nrows, (int) balanced);
+            }
+            return balanced;
+        }
+        // No row count keeps the tiled kernel; fall through to the fit-only policy.
+    }
+
     if (ggml_hexagon_mul_mat_rows_fit(sess, src0, src1, dst, nrows, &kparams)) {
         return nrows;
     }
@@ -4395,8 +4447,7 @@ static int64_t ggml_hexagon_mul_mat_chunk_rows(const struct ggml_hexagon_session
         return 0;
     }
 
-    // Slicing happens on dim 1 only, so refuse batched/broadcast shapes.
-    if (src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+    if (!sliceable) {
         return 0;
     }
 
