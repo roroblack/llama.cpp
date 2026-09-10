@@ -9905,6 +9905,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
+    // Integer-HMX boundary shapes (Codex q30), only when GGML_TBO_INT_BOUNDARY is set so the normal suite is
+    // unchanged: activation rows n around the 32-row minimum and the 256-row block, reduction k around 2048
+    // and the largest FFN K, output rows m around the 32-column tile and a 1536-wide projection, plus an
+    // lm-head-sized output (gemma-4 vocabulary). The reference is the CPU Q4_0 x F32 matmul.
+    if (getenv("GGML_TBO_INT_BOUNDARY")) {
+        for (int64_t n : {1, 31, 32, 33, 255, 256, 257, 512}) {
+            for (int64_t k : {32, 2016, 2048, 2080, 12288}) {
+                for (int64_t m : {1, 31, 32, 33, 1535, 1536, 1537}) {
+                    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
+            }
+        }
+        for (int64_t n : {32, 33, 256}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 262144, n, 1536, {1, 1}, {1, 1}));
+        }
+    }
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));
     }
