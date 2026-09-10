@@ -340,10 +340,19 @@ struct htp_hmx_selftest {
     volatile int ok;
 };
 
+// The lock is not the problem and it is not worth re-deriving: measured with weak
+// references at runtime, qurt_hmx_lock, _unlock, _lock2, _unlock2 and _try_lock all
+// resolve to null in this (unsigned) PD, and HAP_compute_res_hmx_lock2(NON_SHARED)
+// returns 0 with no change in the result.
+// Runtime HMX gate. An architecture number cannot answer this: on SM8735 the HMX unit is
+// present, powered, lockable, moves data through its bias register file to and from VTCM
+// correctly, and faults on an unmapped activation address - yet the fp16 accumulator
+// reads exactly zero, while the integer MAC on the same unit computes. So the only
+// honest test is to do the multiply and look at the answer.
 static void htp_hmx_selftest_fn(void * data) {
-    // Runs inline on the RPC thread that is starting the session, with the HMX
-    // lock already taken by the caller. That is not the production worker, so a
-    // pass here does not prove the worker context also works.
+    // Runs inline on the RPC thread that starts the session, with the HMX lock already
+    // taken by the caller. That is not the production worker, so a pass here does not
+    // prove the worker context also works.
     struct htp_hmx_selftest * a = (struct htp_hmx_selftest *) data;
 
     __fp16 *   act  = (__fp16 *)  (a->vtcm + 0);
@@ -351,12 +360,15 @@ static void htp_hmx_selftest_fn(void * data) {
     __fp16 *   out  = (__fp16 *)  (a->vtcm + 4096);
     uint32_t * bias = (uint32_t *) (a->vtcm + 6144);   // 256-byte aligned
 
+    uint16_t * ai = (uint16_t *) act;
+    uint16_t * wi = (uint16_t *) wgt;
+    uint16_t * oi = (uint16_t *) out;
     for (int i = 0; i < 1024; i++) {
-        act[i] = (__fp16) 1.0f;
-        wgt[i] = (__fp16) 1.0f;
-        out[i] = (__fp16) -1.0f;          // so an untouched output is visible
+        ai[i] = 0x3c00u;                  // 1.0
+        wi[i] = 0x3c00u;                  // 1.0
+        oi[i] = 0xbc00u;                  // -1.0, so an untouched output stays visible
     }
-    // documented identity bias: 32 words of fp16 1.0, then 32 zero words
+    // identity conversion record: fp16 scale 1.0 in the low half, zero high half
     for (int i = 0;  i < 32; i++) { bias[i] = 0x00003c00u; }
     for (int i = 32; i < 64; i++) { bias[i] = 0u; }
 
@@ -365,21 +377,21 @@ static void htp_hmx_selftest_fn(void * data) {
     asm volatile("{\n"
                  "  activation.hf = mxmem(%0, %2):deep\n"
                  "  weight.hf     = mxmem(%1, %2)\n"
-                 "}\n"
-                 :: "r"(act), "r"(wgt), "r"(2047) : "memory");
+                 "}\n" :: "r"(act), "r"(wgt), "r"(2047) : "memory");
     asm volatile("mxmem(%0, %1):after.hf = acc\n" :: "r"(out), "r"(0) : "memory");
 
-    // Every element is a row of 32 ones dotted with a column of 32 ones, so every
-    // element must be exactly 32.0 (0x5000). Checking a couple of them would pass
-    // a unit that is wrong in the other 1022.
-    const uint16_t * o = (const uint16_t *) out;
-    int bad = 0;
+    // Every element is a row of 32 ones dotted with a column of 32 ones, so every element
+    // must be exactly 32.0 (0x5000).
+    int bad = 0, untouched = 0;
     for (int i = 0; i < 1024; i++) {
-        if (o[i] != 0x5000) { bad++; }
+        if (oi[i] != 0x5000u) { bad++; }
+        if (oi[i] == 0xbc00u) { untouched++; }
     }
     a->ok = (bad == 0);
-    FARF(ALWAYS, "hmx-selftest: %d/1024 wrong, first %04x %04x (want 5000) -> %s",
-         bad, o[0], o[1], a->ok ? "HMX usable" : "HMX wrong, falling back to HVX");
+    FARF(ALWAYS, "hmx-selftest: %d/1024 wrong (%d never written), first %04x %04x"
+                 " (want 5000) -> %s",
+         bad, untouched, oi[0], oi[1],
+         a->ok ? "HMX usable" : "HMX wrong, falling back to HVX");
 }
 
 AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
@@ -575,11 +587,26 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         // Power on HMX
         HAP_power_request_t request;
         memset(&request, 0, sizeof(HAP_power_request_t));
+        int err_v2 = -1;
+#ifdef HAP_POWER_SET_HMX_V2_DEFINED
+        memset(&request, 0, sizeof(HAP_power_request_t));
+        request.type                 = HAP_power_set_HMX_v2;
+        request.hmx_v2.set_power     = TRUE;
+        request.hmx_v2.power_up      = TRUE;
+        request.hmx_v2.set_clock     = TRUE;
+        request.hmx_v2.target_corner = HAP_DCVS_EXP_VCORNER_MAX;
+        request.hmx_v2.min_corner    = HAP_DCVS_EXP_VCORNER_MAX;
+        request.hmx_v2.max_corner    = HAP_DCVS_EXP_VCORNER_MAX;
+        request.hmx_v2.perf_mode     = HAP_CLK_PERF_HIGH;
+        err_v2 = HAP_power_set((void *) ctx, &request);
+#endif
+        memset(&request, 0, sizeof(HAP_power_request_t));
         request.type         = HAP_power_set_HMX;
         request.hmx.power_up = TRUE;
         FARF(ALWAYS, "Powering HMX on\n");
         err = HAP_power_set((void *) ctx, &request);
-        if (err != AEE_SUCCESS) {
+        FARF(ALWAYS, "hmx-power: v2 rc %d v1 rc %d", err_v2, err);
+        if (err_v2 != AEE_SUCCESS && err != AEE_SUCCESS) {
             FARF(ERROR, "ggml-hex: error powering on HMX.");
             htp_iface_stop(handle);
             return err;
@@ -853,9 +880,6 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_MUL_MAT_ID:
             return op_matmul_id(octx);
 
-        case HTP_OP_MUL_MAT_ID_NX:
-            return op_matmul_id_nx(octx);
-
         case HTP_OP_MUL_MAT_NX:
             return op_matmul_nx(octx);
 
@@ -871,7 +895,6 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_RMS_NORM_MUL:
         case HTP_OP_SCALE:
         case HTP_OP_CLAMP:
-        case HTP_OP_LEAKY_RELU:
         case HTP_OP_SQR:
         case HTP_OP_SQRT:
         case HTP_OP_UNARY_SOFTPLUS:
@@ -883,7 +906,6 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_TANH:
         case HTP_OP_UNARY_ABS:
         case HTP_OP_UNARY_LOG:
-        case HTP_OP_UNARY_RELU:
         case HTP_OP_L2_NORM:
             return op_unary(octx);
 
@@ -983,8 +1005,8 @@ static inline void drop_mmap(struct htp_context *ctx, struct htp_mmap *m) {
     }
 }
 
-static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
-    if (b->base) return true; // already mapped
+static inline void mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
+    if (b->base) return; // already mapped
 
     // find unused mapping
     for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
@@ -992,8 +1014,8 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
         if (!m->size) {
             void *va = htp_mmap(b->fd, b->size);
             if (va == NULL) {
-                FARF(HIGH, "mmap failed (will attempt defrag) : fd %u size %u", b->fd, (uint32_t) b->size);
-                return false;
+                FARF(ERROR, "mmap failed : fd %u size %u", b->fd, (uint32_t) b->size);
+                abort(); // can't do much else at this point
             }
 
             m->base   = b->base = (uint64_t) va;
@@ -1001,12 +1023,12 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
             m->size   = b->size;
 
             FARF(ALWAYS, "mmap : fd %u base %p size %u", m->fd, (void*) m->base, (uint32_t) m->size);
-            return true;
+            return;
         }
     }
 
     FARF(ERROR, "mmap failed : exceeded mapping capacity limit of %u", HTP_MAX_MMAPS);
-    return false;
+    abort();
 }
 
 static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs) {
@@ -1039,31 +1061,11 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
         }
     }
 
-    // Create missing mappings (pass 1)
-    bool mmap_ok = true;
+    // Create missing mappings
     for (uint32_t i=0; i < n_bufs; i++) {
         struct htp_buf_desc *b = bufs + i;
-        if (!mmap_buf(ctx, b)) {
-            mmap_ok = false;
-            break;
-        }
+        mmap_buf(ctx, b);
         FARF(HIGH, "prep-buf #%u : pass1 fd %u base %p size %u flags 0x%x", i, b->fd, (void*) b->base, (uint32_t) b->size, b->flags);
-    }
-
-    if (!mmap_ok) {
-        // Attempt clean defragmentation: drop all mappings and remap (pass 2)
-        FARF(HIGH, "prep-bufs : dropping all mappings to defragment address space");
-        for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) { drop_mmap(ctx, ctx->mmap + i); }
-
-        for (uint32_t i=0; i < n_bufs; i++) {
-            struct htp_buf_desc *b = bufs + i;
-            b->base = 0;
-            if (!mmap_buf(ctx, b)) {
-                FARF(ERROR, "prep-bufs : mmap failed after defragmentation (fd %u size %u)", b->fd, (uint32_t) b->size);
-                abort();
-            }
-            FARF(HIGH, "prep-buf #%u : pass2 fd %u base %p size %u flags 0x%x", i, b->fd, (void*) b->base, (uint32_t) b->size, b->flags);
-        }
     }
 }
 
@@ -1106,7 +1108,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
         octx->src_dma[i] = octx->ctx->dma; // FIXME: ? octx->ctx->dma_cached : octx->ctx->dma;
 
         FARF(HIGH, "prep-src #%u: data %p size %u : %u:%u:%u:%u", op->src[i], (void*) src->data, src->size,
-            src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+            src->ne[0], src->ne[1], src->ne[3], src->ne[3]);
     }
 
     htp_tensor_flush_all(octx->ctx, octx->src, HTP_OP_MAX_INPUTS);
