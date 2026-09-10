@@ -2207,6 +2207,12 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * d_in = node.dst();
         if (!w_in || !x_in || !d_in) return false;
 
+        // The integer HMX kernel takes flat Q4_0 matmuls one at a time; stacking them into
+        // MUL_MAT_NX would send them back to HVX (the NX op has no integer path).
+        if (sess->int_hmx && opt_mm_int_hmx && w_in->type == GGML_TYPE_Q4_0 && x_in->ne[1] >= opt_mm_int_minrows) {
+            return false;
+        }
+
         htp_opnode & last_node = ops[n_ops - 1];
 
         // Case 1: last_node is already MUL_MAT_NX
