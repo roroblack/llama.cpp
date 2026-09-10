@@ -441,6 +441,46 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
     return {tokens, std::exp(nll / count), logit_history, prob_history};
 }
 
+// Acceptance side channel, off unless PPL_DUMP names a file: for every evaluated token its NLL in full double
+// precision, and per chunk an FNV-1a 64 hash of the raw FP32 logits rows, so two runs of the same text can be
+// compared token by token (paired delta-NLL) and bit for bit (logits hash). Lines written:
+//   T <chunk> <index> <token> <nll>
+//   H <chunk> <rows> <n_vocab> <nan count> <hash>
+static void ppl_dump_chunk(int chunk, int n_vocab, const float * logits, const llama_token * tokens, int n_token) {
+    static FILE * f     = nullptr;
+    static bool   tried = false;
+    if (!tried) {
+        tried = true;
+        const char * p = getenv("PPL_DUMP");
+        if (p && *p) {
+            f = fopen(p, "w");
+            if (!f) {
+                LOG_ERR("PPL_DUMP: cannot open %s\n", p);
+            }
+        }
+    }
+    if (!f) {
+        return;
+    }
+    const size_t n = (size_t) n_token * n_vocab;
+    const unsigned char * b = (const unsigned char *) logits;
+    uint64_t h   = 1469598103934665603ull;
+    size_t   nan = 0;
+    for (size_t i = 0; i < n * sizeof(float); ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        nan += (logits[i] != logits[i]) ? 1 : 0;
+    }
+    for (int i = 0; i < n_token; ++i) {
+        const results_log_softmax r = log_softmax(n_vocab, logits + size_t(i)*n_vocab, tokens[i+1]);
+        fprintf(f, "T %d %d %d %.17g\n", chunk, i, tokens[i+1], -r.log_softmax);
+    }
+    fprintf(f, "H %d %d %d %zu %016llx\n", chunk, n_token, n_vocab, nan, (unsigned long long) h);
+    fflush(f);
+}
+
 static results_perplexity perplexity(llama_context * ctx, const common_params & params, const int32_t n_ctx) {
     if (params.ppl_stride > 0) {
         return perplexity_v2(ctx, params);
@@ -625,6 +665,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                         workers, nll, nll2,
                         logit_history.data() + start + seq*n_ctx + first,
                         prob_history.data()  + start + seq*n_ctx + first);
+                ppl_dump_chunk(i + seq, n_vocab, all_logits, tokens_data, n_ctx - 1 - first);
             }
             count += n_ctx - first - 1;
 
