@@ -3188,42 +3188,45 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         if (hw_err == 0) {
             this->n_threads = opt_nhvx > 0 ? (uint32_t)opt_nhvx : (uint32_t)hw_n_threads;
             this->n_hvx     = opt_nhvx > 0 ? (uint32_t)opt_nhvx : (uint32_t)hw_n_hvx;
-            // Default policy only. The real decision is made at run time: the DSP
+            // Starting point only. The decision is made by measurement below: the DSP
             // multiplies a tile of 1.0 by a tile of 1.0 during htp_iface_start and the
-            // host re-reads n_hmx below, so a part where HMX silently returns zeros is
-            // caught by measurement rather than by its architecture number.
+            // host re-reads n_hmx, in BOTH directions - a v73 part whose HMX works gets
+            // it enabled there, and a part where HMX silently returns zeros gets it taken
+            // away. The architecture number only covers the case where the self test
+            // cannot run, since it needs the compute resource acquired.
             //
-            // Kept as a fallback because the self test cannot always run (it needs the
-            // compute resource acquired), and because it is what was measured here.
+            // Why v73 starts off, measured on SM8735 (Snapdragon 8s Gen 4):
+            //   * with HMX on, every op taking the hmx-tiled path fails test-backend-ops
+            //     MUL_MAT - 42 hmx-tiled ops, 42 failures, no others - and every failing
+            //     output is exactly 0. With HMX off, 556/556 pass.
+            //   * the unit is alive: a bias-register round trip through VTCM
+            //     ("bias = mxmem2(src)" then "mxmem2(dst) = bias", no multiply at all)
+            //     returns 64/64 identical, ":before" and ":after" stores behave
+            //     differently, and an activation load from an unmapped address faults.
+            //   * the INTEGER MAC on that same unit computes: 1024/1024 non-zero, out[0]
+            //     matching Qualcomm's own v73 simulator exactly.
+            //   * fp16 returns zero under every variation tried, including Qualcomm's own
+            //     intrinsics, which give 1024/1024 correct in Qualcomm's own v73 model.
+            // So it is the fp16 datapath on this part, and llama.cpp's HMX kernels are
+            // fp16-only. This is NOT "v73 cannot do fp16 HMX": the published v73 results
+            // behind htp-ops-lib are on a part where it does work, and every .hf intrinsic
+            // in hmx_hexagon_protos.h sits outside all __HMX_ARCH__ guards, i.e. v68 up.
             //
-            // WORKAROUND, and the cause is still open.
+            // An earlier reading here was wrong and is kept so it is not repeated:
+            //   "Zeroing the HMX inputs still yields inf, so the unit does not compute."
+            //   That run also zeroed the bias, but the identity record is 32 words of
+            //   0x3c00 then 32 zero words - a zero scale is not identity - and the load
+            //   asm carried no memory clobber. The outputs were 0x0000, not inf; the inf
+            //   came from an error metric dividing by an all-zero result.
             //
-            // What is measured: with HMX on, every op that takes the hmx-tiled path fails
-            // test-backend-ops MUL_MAT (42 hmx-tiled ops, 42 failures, no others) while the
-            // HVX paths are correct; GGML_HEXAGON_NHMX=0 gives 554/554 and correct model
-            // output. Turning HMX off below v75 is therefore a workaround that works.
-            //
-            // What this is NOT: a statement about the silicon. Two earlier readings here
-            // were wrong and are recorded so they are not repeated.
-            //   * "v73 cannot do fp16 HMX." Qualcomm's own hmx_hexagon_protos.h puts every
-            //     .hf HMX intrinsic outside all __HMX_ARCH__ guards, i.e. from v68 up. What
-            //     v73 actually adds is the split store, cvt.hf=acc / mxmem(Rs,Rt)=cvt.
-            //   * "Zeroing the HMX inputs still yields inf, so the unit does not compute."
-            //     That run also zeroed the bias, but the documented identity bias is 32
-            //     words of 0x3c00 followed by 32 zero words -- a zero scale is not identity.
-            //     The load asm also carried no memory clobber, so the zeroing could have
-            //     been reordered past the HMX reads. The experiment proved nothing.
-            //
-            // An explicit GGML_HEXAGON_NHMX overrides this gate, which is how the fp16 HMX
-            // diagnostics (NHMX=2..6, see htp/hmx-utils.h) reach a v73 part.
-            // Only the diagnostic modes bypass the gate. GGML_HEXAGON_NHMX=1 is an
-            // ordinary user setting and must keep the workaround; letting it through
-            // would quietly re-enable the failing path this gate exists to avoid.
+            // An explicit GGML_HEXAGON_NHMX overrides this starting point, which is how
+            // the fp16 HMX diagnostics (NHMX=2..6, see htp/hmx-utils.h) reach a v73 part.
+            // Only the diagnostic modes bypass it: GGML_HEXAGON_NHMX=1 is an ordinary user
+            // setting and must not quietly re-enable a path the self test is there to judge.
             const bool hmx_arch_ok = (opt_arch >= 75) || opt_nhmx_diag;
             this->n_hmx     = (opt_nhmx != 0 && hmx_arch_ok) ? (uint32_t)hw_n_hmx : 0;
             if (opt_nhmx != 0 && !hmx_arch_ok && hw_n_hmx) {
-                GGML_LOG_WARN("ggml-hex: HMX disabled on Hexagon v%d (fp16 HMX unusable below v75)
-", opt_arch);
+                GGML_LOG_WARN("ggml-hex: HMX starts off on Hexagon v%d; the self test decides\n", opt_arch);
             }
             hw_has_hmx      = (hw_n_hmx != 0);
             this->vtcm_size = (uint64_t)hw_vtcm_size;
