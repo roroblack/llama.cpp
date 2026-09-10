@@ -372,6 +372,12 @@ struct htp_hmx_selftest {
 // DDR<->VTCM bandwidth through the kernels' own DMA queue.
 #define DMA_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
 #include "hmxdma.h"
+// Wide read: retain store, lo/hi conversion records, and where the 2^8 quantum is lost.
+#define EXT_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxext.h"
+// Q4_0 x f32 GEMM prototype on the integer HMX path, against f32, int64 and Q8_0 references.
+#define Q4G_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxq4gemm.h"
 
 // Which VTCM partitions exist, and how big? application_id selects the partition;
 // only id 0 had been queried before (8 MB).
@@ -442,6 +448,8 @@ static void htp_hmx_selftest_fn(void * data) {
     hmxperf_run(a->vtcm + (1u << 20));
     hmxbigk_run(a->vtcm + (2u << 20));
     hmxacc_run(a->vtcm + (3u << 20));
+    hmxext_run(a->vtcm + (3u << 20) + (256u << 10));
+    hmxq4gemm_run(a->vtcm + (5u << 20));
 #endif
 }
 
