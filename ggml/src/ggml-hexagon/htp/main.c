@@ -349,6 +349,39 @@ struct htp_hmx_selftest {
 // correctly, and faults on an unmapped activation address - yet the fp16 accumulator
 // reads exactly zero, while the integer MAC on the same unit computes. So the only
 // honest test is to do the multiply and look at the answer.
+#if defined(HTP_DEBUG)
+// Integer HMX linearity probe - debug builds only. Same source as the hexagon-sim harness
+// (intlin.h), so the two outputs can be compared bit for bit.
+#define INTLIN_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "intlin.h"
+// Geometry verification: random 32x32x32 integer matmul against a scalar reference.
+#define VER_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxver.h"
+// Conversion record and K accumulation, same source as the simulator harness.
+#define CONV_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxconv.h"
+// Integer HMX throughput - the go/no-go number for an integer MUL_MAT kernel.
+#define PERF_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxperf.h"
+
+// Which VTCM partitions exist, and how big? application_id selects the partition;
+// only id 0 had been queried before (8 MB).
+static void htp_vtcm_partition_probe(void) {
+    for (unsigned app = 0; app < 6; app++) {
+        unsigned int total = 0, avail = 0;
+        compute_res_vtcm_page_t tl, al;
+        memset(&tl, 0, sizeof(tl));
+        memset(&al, 0, sizeof(al));
+        int rc = HAP_compute_res_query_VTCM(app, &total, &tl, &avail, &al);
+        FARF(ALWAYS, "VTCMQ app=%u rc=%d total=%u avail=%u block=%u npages=%u p0=%ux%u p1=%ux%u p2=%ux%u",
+             app, rc, total, avail, tl.block_size, tl.page_list_len,
+             tl.page_list[0].page_size, tl.page_list[0].num_pages,
+             tl.page_list[1].page_size, tl.page_list[1].num_pages,
+             tl.page_list[2].page_size, tl.page_list[2].num_pages);
+    }
+}
+#endif
+
 static void htp_hmx_selftest_fn(void * data) {
     // Runs inline on the RPC thread that starts the session, with the HMX lock already
     // taken by the caller. That is not the production worker, so a pass here does not
@@ -392,6 +425,13 @@ static void htp_hmx_selftest_fn(void * data) {
                  " (want 5000) -> %s",
          bad, untouched, oi[0], oi[1],
          a->ok ? "HMX usable" : "HMX wrong, falling back to HVX");
+#if defined(HTP_DEBUG)
+    intlin_run(a->vtcm + 65536);   // 2 KB aligned, clear of the fp16 tiles above
+    hmxver_run(a->vtcm + 131072);
+    hmxconv_run(a->vtcm + 262144);
+    htp_vtcm_partition_probe();
+    hmxperf_run(a->vtcm + (1u << 20));
+#endif
 }
 
 AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
