@@ -382,6 +382,8 @@ struct htp_hmx_selftest {
 #include "hmxq4qt.h"
 // Resident HVX combine for the Q4_0 integer-HMX GEMM, correctness and cycles (Codex step 2).
 #include "hmxcomb.h"
+// Q4_0 block scale inside HMX's own converter: exactness, accuracy, cycles.
+#include "hmxscl.h"
 
 // Which VTCM partitions exist, and how big? application_id selects the partition;
 // only id 0 had been queried before (8 MB).
@@ -456,6 +458,7 @@ static void htp_hmx_selftest_fn(void * data) {
     hmxq4gemm_run(a->vtcm + (5u << 20));
     hmxq4qt_run(a->vtcm + (5u << 20) + (256u << 10));
     hmxcomb_run(a->vtcm + (6u << 20));
+    hmxscl_run(a->vtcm + (6u << 20) + (512u << 10));
 #endif
 }
 
