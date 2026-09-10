@@ -47,6 +47,8 @@ extern "C" {
 #define HTP_MM_DMA_ACT_ROWS_PER_STEP 2
 #define HTP_MM_DMA_ACT_MULTIPLIER    (2 * HTP_MM_DMA_ACT_ROWS_PER_STEP)
 
+#include "hmx-int-plan.h"
+
 enum htp_mm_kernel_type {
     HTP_MM_KERNEL_UNSUPPORTED = 0,
 
@@ -67,6 +69,10 @@ enum htp_mm_kernel_type {
     HTP_MM_KERNEL_HVX_QUANT_ROW,      // standard row-wise parallel quantization
     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
     HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT, // row-wise fallback flat quantization
+
+    // integer HMX (Q4_0 x F32) for parts whose fp16 HMX does not compute; appended so the
+    // numbering of the kernels above does not change
+    HTP_MM_KERNEL_HMX_Q4_INT,
 };
 
 // Op-specific struct for precomputed matmul params

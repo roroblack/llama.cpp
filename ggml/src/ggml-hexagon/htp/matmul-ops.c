@@ -23,6 +23,8 @@
 #include "htp-ops.h"
 #include "matmul-ops.h"
 #include "htp-vtcm.h"
+#include "hmx-int.h"
+#include "hmx-int-mm.h"
 
 static void hvx_tensor_add_f32_grid(
     const struct htp_tensor * restrict dst,
@@ -3381,7 +3383,16 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
 
     int ret = -1;
     const int n_threads = MIN(kparams->n_threads, (int) octx->n_threads);
-    if (kparams->kernel_type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
+    if (kparams->kernel_type == HTP_MM_KERNEL_HMX_Q4_INT) {
+        // The host never fuses MUL_MAT_ADD into this kernel and only selects it for Q4_0.
+        if (src2 || src0->type != HTP_TYPE_Q4_0) {
+            FARF(ERROR, "int-hmx: unexpected src2 %p or weight type %d", (void *) src2, (int) src0->type);
+            return HTP_STATUS_INTERNAL_ERR;
+        }
+        ret = hmx_mm_q4int_2d_f32(octx->ctx, (float *) dst->data, (int) (dst->nb[1] / sizeof(float)), (int) dst->ne[0],
+                                  (const float *) src1->data, act_stride, (const uint8_t *) src0->data,
+                                  m_total, k, n, n_threads, kparams->vtcm_size);
+    } else if (kparams->kernel_type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
         hmx_mm_f16_f32_batched_params_t batch_params = {
             .dst             = (float *) dst->data,
             .src2            = src2_ptr,
@@ -3418,7 +3429,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
                                      &kparams->div_n_act_threads,
                                      &kparams->div_ne00_padded,
                                      kparams->vtcm_size);
-    } else {
+    } else if (kparams->kernel_type == HTP_MM_KERNEL_HMX_2D) {
         ret = hmx_mm_2d_f32(
             octx->ctx, (float*) dst->data, src2_ptr, (float*) src1->data, (const uint8_t *) src0->data,
             m_total, k, n, act_stride, (int) src0->nb[1], (int) src0->type, (int) src1->ne[0],
@@ -3429,6 +3440,10 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
             &kparams->div_ne00_padded,
             kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size
         );
+    } else {
+        // an unknown HMX kernel used to fall through to the fp16 2D path
+        FARF(ERROR, "HMX matmul: unknown kernel type %d", (int) kparams->kernel_type);
+        return HTP_STATUS_INTERNAL_ERR;
     }
 
     if (ret != 0) {

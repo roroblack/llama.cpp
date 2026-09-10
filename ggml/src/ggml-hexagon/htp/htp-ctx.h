@@ -90,6 +90,9 @@ struct htp_context {
     // 3 = could not be run. Kept per session: several sessions share one loaded
     // library, so a global would let one read another session's verdict.
     uint32_t               hmx_probe_status;
+    // Same codes, for the integer HMX path (hmx-int.h). Reported to the host as bit 1 of
+    // hwinfo's n_hmx (bit 0 stays the fp16 verdict).
+    uint32_t               hmx_int_status;
     bool                   etm;
     uint32_t               profiler;
     struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];

@@ -100,6 +100,9 @@ static int    opt_mm_chunk  = 2; // 0 = refuse a MUL_MAT whose activation block 
                                  //     Measured pp512 on SM8735 at ubatch 256:
                                  //     mode 1 18.68 +/- 0.63 t/s, mode 2 31.42 +/- 1.01.
                                  //     MUL_MAT stays 556/556 either way.
+static int    opt_mm_int_hmx = 0;      // 1 = use the integer HMX Q4_0 matmul where the DSP verified it
+                                       // (parts whose fp16 HMX does not compute, e.g. SM8735 / v73)
+static int    opt_mm_int_minrows = 32; // integer HMX only for MUL_MATs with at least this many rows
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
@@ -400,6 +403,7 @@ struct ggml_hexagon_session {
     uint32_t n_threads   = 0;
     uint32_t n_hvx       = 0;
     uint32_t n_hmx       = 0;
+    bool     int_hmx     = false; // DSP verified the integer HMX path
     uint64_t vtcm_size   = 0;
     size_t   max_vmem    = 0;
     size_t   max_bufsize = 0;
@@ -3232,7 +3236,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             // Only the diagnostic modes bypass it: GGML_HEXAGON_NHMX=1 is an ordinary user
             // setting and must not quietly re-enable a path the self test is there to judge.
             const bool hmx_arch_ok = (opt_arch >= 75) || opt_nhmx_diag;
-            this->n_hmx     = (opt_nhmx != 0 && hmx_arch_ok) ? (uint32_t)hw_n_hmx : 0;
+            // hwinfo's n_hmx is a bit field now (bit 0 fp16, bit 1 integer): never copy it as a count
+            this->n_hmx     = (opt_nhmx != 0 && hmx_arch_ok && (hw_n_hmx & 1u)) ? 1 : 0;
             if (opt_nhmx != 0 && !hmx_arch_ok && hw_n_hmx) {
                 GGML_LOG_WARN("ggml-hex: HMX starts off on Hexagon v%d; the self test decides\n", opt_arch);
             }
@@ -3327,11 +3332,20 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         unsigned int v_threads = 0, v_hvx = 0, v_hmx = 0;
         unsigned long long v_vtcm = 0;
         if (htp_iface_hwinfo(this->handle, &v_threads, &v_hvx, &v_hmx, &v_vtcm) == 0) {
-            if (this->n_hmx && v_hmx == 0) {
+            // bit 0: the fp16 self test computed 32.0; bit 1: the integer self test was exact.
+            // An old host reading bit 1 alone would enable the fp16 paths - deploy host and DSP together.
+            const bool fp16_ok = (v_hmx & 1u) != 0;
+            const bool int_ok  = (v_hmx & 2u) != 0;
+            this->int_hmx = int_ok && opt_nhmx != 0 && hw_has_hmx;
+            if (int_ok) {
+                GGML_LOG_INFO("ggml-hex: %s integer HMX self test passed; integer Q4_0 matmul %s\n", this->c_name(),
+                              opt_mm_int_hmx ? "on (GGML_HEXAGON_INT_HMX=1)" : "off (set GGML_HEXAGON_INT_HMX=1)");
+            }
+            if (this->n_hmx && !fp16_ok) {
                 GGML_LOG_WARN("ggml-hex: %s HMX self test computed the wrong answer; using HVX\n",
                               this->c_name());
                 this->n_hmx = 0;
-            } else if (!this->n_hmx && v_hmx != 0 && opt_nhmx != 0 && hw_has_hmx) {
+            } else if (!this->n_hmx && fp16_ok && opt_nhmx != 0 && hw_has_hmx) {
                 GGML_LOG_INFO("ggml-hex: %s HMX self test passed on v%d; enabling HMX\n",
                               this->c_name(), opt_arch);
                 this->n_hmx = 1;
@@ -3996,6 +4010,44 @@ static void ggml_hexagon_precompute_hvx_mm_params(
     }
 }
 
+// Integer HMX Q4_0 x F32 (DSP: hmx-int.h / hmx-int-mm.h). Flat 2D only, no MUL_MAT_ID, no fused
+// MUL_MAT_ADD, and only when the DSP's integer self test passed and GGML_HEXAGON_INT_HMX=1.
+static bool ggml_hexagon_precompute_int_hmx_mm_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * dst,
+    bool is_matmul_id,
+    bool is_batched,
+    struct htp_mm_kernel_params * kparams
+) {
+    if (src0->type != GGML_TYPE_Q4_0 || is_matmul_id || is_batched) return false;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    const int k = (int) src0->ne[0];
+    const int n = (int) src0->ne[1];
+    const int m = (int) src1->ne[1];
+    if (k % 32 != 0 || m < opt_mm_int_minrows) return false;
+    if (src0->nb[0] > src0->nb[1] || src1->nb[0] != sizeof(float) || src1->nb[0] > src1->nb[1]) return false;
+    struct hmxi_layout L;
+    if (!hmxi_plan(k, m, n, (int) sess->n_threads, (size_t) sess->vtcm_size, &L)) return false;
+
+    kparams->n_hmx       = 1;
+    kparams->kernel_type = HTP_MM_KERNEL_HMX_Q4_INT;
+    kparams->n_threads   = (int) sess->n_threads;
+    kparams->m_chunk     = L.mc;
+    kparams->n_chunk     = L.nct;
+    kparams->vtcm_size   = (int) sess->vtcm_size;
+
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        GGML_LOG_INFO("ggml-hex: %s integer HMX Q4_0 matmul selected (first: m %d k %d n %d, mc %d nct %d)\n",
+                      sess->c_name(), m, k, n, L.mc, L.nct);
+    }
+    HEX_VERBOSE("ggml-hex: %s int-hmx mul_mat m %d k %d n %d\n", sess->c_name(), m, k, n);
+    return true;
+}
+
 static void ggml_hexagon_precompute_matmul_params_impl(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,
@@ -4029,6 +4081,14 @@ static void ggml_hexagon_precompute_matmul_params_impl(
 
     // Check HMX eligibility and try precomputing HMX parameters
     bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
+
+    // Integer HMX first (after the declaration above: C++ forbids jumping past it). On a part where
+    // only the integer path verified, sess->n_hmx is 0 and the fp16 selection below stays off.
+    // src2_row_size != 0 is the fused MUL_MAT_ADD, not handled.
+    if (sess->int_hmx && opt_mm_int_hmx && opt_mm_select >= 3 && src2_row_size == 0 &&
+        ggml_hexagon_precompute_int_hmx_mm_params(sess, src0, src1, dst, is_matmul_id, is_batched, kparams)) {
+        goto finalize;
+    }
     if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
         if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {
             goto finalize;
@@ -6600,6 +6660,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_mm_chunk  = getenv("GGML_HEXAGON_MM_CHUNK");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
+    const char * str_mm_int    = getenv("GGML_HEXAGON_INT_HMX");
+    const char * str_mm_int_minrows = getenv("GGML_HEXAGON_INT_HMX_MINROWS");
     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
@@ -6652,6 +6714,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_mm_chunk  = str_mm_chunk  ? atoi(str_mm_chunk)                    : opt_mm_chunk;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
+    opt_mm_int_hmx = str_mm_int   ? atoi(str_mm_int)                      : opt_mm_int_hmx;
+    opt_mm_int_minrows = str_mm_int_minrows ? atoi(str_mm_int_minrows)    : opt_mm_int_minrows;
     opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;

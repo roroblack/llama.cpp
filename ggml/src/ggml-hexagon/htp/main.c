@@ -35,6 +35,7 @@
 #include "work-queue.h"
 #include "hex-profile.h"
 #include "allreduce-ops.h"
+#include "hmx-int.h"
 
 #define HMX_QUEUE_CAPACITY     16
 #define HMX_QUEUE_STACK_SIZE   16384
@@ -693,6 +694,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         ctx->hmx_queue = hmx_queue_init(hmx_ptr, HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE, ctx->vtcm_rctx, &ctx->trace[HTP_MAX_NTHREADS]);
     }
     ctx->hmx_probe_status = HTP_HMX_PROBE_NOT_RUN;
+    ctx->hmx_int_status   = HTP_HMX_PROBE_NOT_RUN;
     // 3 tiles of 2048 plus a 256-byte bias, and the bias must land 256-aligned.
     if (ctx->hmx_enabled && ctx->vtcm_base && ctx->vtcm_size >= 8192 &&
         (((uintptr_t) ctx->vtcm_base) % 256u) == 0u) {
@@ -706,6 +708,14 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         int lrc = HAP_compute_res_hmx_lock(ctx->vtcm_rctx);
         if (lrc == AEE_SUCCESS) {
             htp_hmx_selftest_fn(&st);
+            // The integer path, under the same lock: one exact 32x32x32 integer matmul through
+            // the store ABI the kernel relies on (hmx-int.h).
+            {
+                const int ibad = hmxi_selftest((uint8_t *) ctx->vtcm_base + 16384);
+                ctx->hmx_int_status = ibad == 0 ? HTP_HMX_PROBE_PASS : HTP_HMX_PROBE_WRONG;
+                FARF(ALWAYS, "hmx-int-selftest: %d/1024 wrong -> %s", ibad,
+                     ibad ? "integer HMX unusable" : "integer HMX usable");
+            }
             HAP_compute_res_hmx_unlock(ctx->vtcm_rctx);
             ctx->hmx_probe_status = st.ok ? HTP_HMX_PROBE_PASS : HTP_HMX_PROBE_WRONG;
         } else {
@@ -855,7 +865,9 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     // probe there is nothing measured to report, so fall back to the default.
     struct htp_handle * hh = (struct htp_handle *) handle;
     if (hh && hh->ctx && hh->ctx->hmx_probe_status != HTP_HMX_PROBE_NOT_RUN) {
-        *n_hmx = (hh->ctx->hmx_probe_status == HTP_HMX_PROBE_WRONG) ? 0 : 1;
+        // bit 0: fp16 HMX usable (unchanged meaning), bit 1: integer HMX verified
+        *n_hmx = ((hh->ctx->hmx_probe_status == HTP_HMX_PROBE_WRONG) ? 0u : 1u) |
+                 ((hh->ctx->hmx_int_status == HTP_HMX_PROBE_PASS) ? 2u : 0u);
     } else {
         *n_hmx = htp_hmx_verified;
     }
