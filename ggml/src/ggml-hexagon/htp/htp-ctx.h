@@ -93,6 +93,7 @@ struct htp_context {
     // Same codes, for the integer HMX path (hmx-int.h). Reported to the host as bit 1 of
     // hwinfo's n_hmx (bit 0 stays the fp16 verdict).
     uint32_t               hmx_int_status;
+    void *                 hmxi_job;          // integer-HMX matmul job state (hmx-int-mm.h), per context
     bool                   etm;
     uint32_t               profiler;
     struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];

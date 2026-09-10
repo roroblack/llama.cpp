@@ -176,6 +176,10 @@ AEEResult htp_iface_close(remote_handle64 handle) {
             HAP_user_etm_disable();
         }
 
+        if (ctx->hmxi_job) {
+            free(ctx->hmxi_job);
+            ctx->hmxi_job = NULL;
+        }
         // Free the unified block (ctx is the base address of the block)
         free(ctx);
         h->ctx = NULL;
@@ -387,6 +391,9 @@ struct htp_hmx_selftest {
 #include "hmxscl.h"
 // Step 3: the calling thread holds the HMX lock and produces, work-queue workers combine.
 #include "hmxpipe.h"
+// fp16 HMX settled by experiment (Codex q23 design): integer -> fp16 cases -> integer, full counts.
+#define FP16_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxfp16.h"
 
 // Which VTCM partitions exist, and how big? application_id selects the partition;
 // only id 0 had been queried before (8 MB).
@@ -462,6 +469,7 @@ static void htp_hmx_selftest_fn(void * data) {
     hmxq4qt_run(a->vtcm + (5u << 20) + (256u << 10));
     hmxcomb_run(a->vtcm + (6u << 20));
     hmxscl_run(a->vtcm + (6u << 20) + (512u << 10));
+    hmxfp16_run(a->vtcm + (7u << 20));
 #endif
 }
 

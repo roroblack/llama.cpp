@@ -103,6 +103,7 @@ static int    opt_mm_chunk  = 2; // 0 = refuse a MUL_MAT whose activation block 
 static int    opt_mm_int_hmx = 0;      // 1 = use the integer HMX Q4_0 matmul where the DSP verified it
                                        // (parts whose fp16 HMX does not compute, e.g. SM8735 / v73)
 static int    opt_mm_int_minrows = 32; // integer HMX only for MUL_MATs with at least this many rows
+static int    opt_mm_int_nc = 0;       // integer HMX consumer threads (0 = all HVX threads)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
@@ -4028,12 +4029,16 @@ static bool ggml_hexagon_precompute_int_hmx_mm_params(
     const int m = (int) src1->ne[1];
     if (k % 32 != 0 || m < opt_mm_int_minrows) return false;
     if (src0->nb[0] > src0->nb[1] || src1->nb[0] != sizeof(float) || src1->nb[0] > src1->nb[1]) return false;
+    // consumers: all HVX threads unless GGML_HEXAGON_INT_HMX_NC caps them; host and DSP plan the VTCM
+    // layout with this same number (the DSP takes min(kparams->n_threads, its thread count))
+    int nc = (int) sess->n_threads;
+    if (opt_mm_int_nc > 0 && opt_mm_int_nc < nc) nc = opt_mm_int_nc;
     struct hmxi_layout L;
-    if (!hmxi_plan(k, m, n, (int) sess->n_threads, (size_t) sess->vtcm_size, &L)) return false;
+    if (!hmxi_plan(k, m, n, nc, (size_t) sess->vtcm_size, &L)) return false;
 
     kparams->n_hmx       = 1;
     kparams->kernel_type = HTP_MM_KERNEL_HMX_Q4_INT;
-    kparams->n_threads   = (int) sess->n_threads;
+    kparams->n_threads   = nc;
     kparams->m_chunk     = L.mc;
     kparams->n_chunk     = L.nct;
     kparams->vtcm_size   = (int) sess->vtcm_size;
@@ -4041,8 +4046,8 @@ static bool ggml_hexagon_precompute_int_hmx_mm_params(
     static bool announced = false;
     if (!announced) {
         announced = true;
-        GGML_LOG_INFO("ggml-hex: %s integer HMX Q4_0 matmul selected (first: m %d k %d n %d, mc %d nct %d)\n",
-                      sess->c_name(), m, k, n, L.mc, L.nct);
+        GGML_LOG_INFO("ggml-hex: %s integer HMX Q4_0 matmul selected (first: m %d k %d n %d, mc %d nct %d nc %d)\n",
+                      sess->c_name(), m, k, n, L.mc, L.nct, L.nc);
     }
     HEX_VERBOSE("ggml-hex: %s int-hmx mul_mat m %d k %d n %d\n", sess->c_name(), m, k, n);
     return true;
@@ -6662,6 +6667,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_mm_int    = getenv("GGML_HEXAGON_INT_HMX");
     const char * str_mm_int_minrows = getenv("GGML_HEXAGON_INT_HMX_MINROWS");
+    const char * str_mm_int_nc = getenv("GGML_HEXAGON_INT_HMX_NC");
     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
@@ -6716,6 +6722,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_mm_int_hmx = str_mm_int   ? atoi(str_mm_int)                      : opt_mm_int_hmx;
     opt_mm_int_minrows = str_mm_int_minrows ? atoi(str_mm_int_minrows)    : opt_mm_int_minrows;
+    opt_mm_int_nc = str_mm_int_nc ? atoi(str_mm_int_nc)                   : opt_mm_int_nc;
     opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;

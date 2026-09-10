@@ -65,6 +65,29 @@ static void hmxi_job_cvt(unsigned int n, unsigned int i, void * data) {
         hmxi_cvt_coltile(j->weight + (size_t) (j->ct0 + c) * B * 576, B, j->wt + (size_t) c * B * 1024, j->cv + c * B, j->dv + c * B, j->mid + c);
 }
 
+// Codex q25: when a group has fewer column tiles than workers (K=12288 -> nct=2), splitting by column
+// tile leaves workers idle. Split into (column tile, run of up to 32 K blocks) tasks instead; every
+// task writes its own wt/cv/dv slots, and mid is summed afterwards in the same b order as before.
+#define HMXI_CVT_KRUN 32
+static void hmxi_job_cvt_k(unsigned int n, unsigned int i, void * data) {
+    struct hmxi_job * j = (struct hmxi_job *) data;
+    const int B = j->L.B, nkr = (B + HMXI_CVT_KRUN - 1) / HMXI_CVT_KRUN;
+    for (int t = (int) i; t < j->nct * nkr; t += (int) n) {
+        const int c = t / nkr, b0 = (t % nkr) * HMXI_CVT_KRUN;
+        const int b1 = B - b0 < HMXI_CVT_KRUN ? B : b0 + HMXI_CVT_KRUN;
+        const uint8_t * src = j->weight + (size_t) (j->ct0 + c) * B * 576;
+        for (int b = b0; b < b1; b++)
+            hmxi_cvt_tile(src + (size_t) b * 576, (HVX_Vector *) (j->wt + ((size_t) c * B + b) * 1024), j->cv + c * B + b, j->dv + c * B + b);
+    }
+}
+
+// mid = 128 * sum_b d_b = 0.5 * sum_b dv_b, same order and arithmetic as hmxi_cvt_coltile
+static void hmxi_mid_from_dv(const HVX_Vector * dv, int B, HVX_Vector * mid) {
+    HVX_Vector acc = Q6_V_vzero();
+    for (int b = 0; b < B; b++) acc = Q6_Vqf32_vadd_Vqf32Vsf(acc, dv[b]);
+    *mid = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(acc), Q6_V_vsplat_R(0x3f000000)));
+}
+
 static void hmxi_job_produce(void * data) {
     struct hmxi_job * j = (struct hmxi_job *) data;
     if (!j->hq->hmx_locked) { atomic_store(&j->abort, 1); return; }
@@ -123,7 +146,13 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     if (V == 0 || V > ctx->vtcm_size) V = ctx->vtcm_size;
     int nc = n_threads;
     if (nc > (int) ctx->n_threads) nc = (int) ctx->n_threads;
-    static struct hmxi_job J;   // ops run one at a time on the session's main thread
+    // One job per context: a function static would be shared by every session in the DSP process.
+    if (!ctx->hmxi_job) {
+        ctx->hmxi_job = memalign(128, sizeof(struct hmxi_job));
+        if (!ctx->hmxi_job) return -6;
+    }
+    struct hmxi_job * const Jp = (struct hmxi_job *) ctx->hmxi_job;
+#define J (*Jp)
     memset(&J, 0, sizeof(J));
     if (!hmxi_plan(k, m, n, nc, V, &J.L)) return -3;
 
@@ -147,19 +176,31 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     for (int m0 = 0; m0 < m; m0 += J.L.mc) {
         J.m0 = m0; J.mr = m - m0 < J.L.mc ? m - m0 : J.L.mc; J.n_rt = (J.mr + 31) / 32;
         t0 = HAP_perf_get_pcycles();
-        work_queue_run(ctx->work_queue, hmxi_job_quant, &J, ctx->n_threads);
+        if (!work_queue_run(ctx->work_queue, hmxi_job_quant, &J, ctx->n_threads)) return -7;
         tA += HAP_perf_get_pcycles() - t0;
         for (int ct0 = 0; ct0 < n_ct_all; ct0 += J.L.nct) {
             J.ct0 = ct0; J.nct = n_ct_all - ct0 < J.L.nct ? n_ct_all - ct0 : J.L.nct;
             t0 = HAP_perf_get_pcycles();
-            work_queue_run(ctx->work_queue, hmxi_job_cvt, &J, ctx->n_threads);
+            if (J.nct < (int) ctx->n_threads) {
+                if (!work_queue_run(ctx->work_queue, hmxi_job_cvt_k, &J, ctx->n_threads)) return -8;
+                for (int c = 0; c < J.nct; c++) hmxi_mid_from_dv(J.dv + c * J.L.B, J.L.B, J.mid + c);
+            } else {
+                if (!work_queue_run(ctx->work_queue, hmxi_job_cvt, &J, ctx->n_threads)) return -8;
+            }
             tW += HAP_perf_get_pcycles() - t0;
             for (int w = 0; w < HMXI_MAXW; w++) { atomic_store(&J.ready[w].v, 0); atomic_store(&J.freed[w].v, 0); }
             atomic_store(&J.abort, 0);
             t0 = HAP_perf_get_pcycles();
             if (!hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmxi_job_produce, &J))) return -4;
-            work_queue_run(ctx->work_queue, hmxi_job_consume, &J, (unsigned) J.L.nc);
+            // If the consumers cannot be started the producer would fill the rings and spin: raise
+            // abort so it returns, and still pop it before anything reuses this VTCM.
+            const bool consumed = work_queue_run(ctx->work_queue, hmxi_job_consume, &J, (unsigned) J.L.nc);
+            if (!consumed) atomic_store(&J.abort, 1);
             hmx_queue_pop(ctx->hmx_queue);
+            if (!consumed) {
+                FARF(ERROR, "int-hmx: consumer launch failed; producer aborted and drained");
+                return -9;
+            }
             tP += HAP_perf_get_pcycles() - t0;
             if (atomic_load(&J.abort)) {
                 FARF(ERROR, "int-hmx: the HMX queue thread does not hold the HMX lock; not issuing HMX");
@@ -170,6 +211,7 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     FARF(HIGH, "int-hmx m %d k %d n %d: mc %d nct %d nseg %d nc %d | quant %llu cvt %llu pipe %llu kcycles",
          m, k, n, J.L.mc, J.L.nct, J.L.nseg, J.L.nc, tA / 1000, tW / 1000, tP / 1000);
     return 0;
+#undef J
 }
 
 #endif /* HMX_INT_MM_H */
