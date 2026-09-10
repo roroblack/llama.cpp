@@ -43,6 +43,9 @@
 struct htp_fa_context {
     const struct htp_ops_context * octx;
 
+    // PV with the f32 accumulator in registers across a K/V block (GGML_HEXAGON_FA_PVREG=1, bit-identical)
+    bool pv_regacc;
+
     struct fastdiv_values src0_div21;
     struct fastdiv_values src0_div1;
 
@@ -481,6 +484,9 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                 // 5. Accumulate V (F16 * F16 -> F32 accumulator)
                 const uint8_t * v_ptr = v_base;
 
+                if (factx->pv_regacc) {
+                    hvx_pv_block_regacc(VKQ32, v_base, factx->size_v_row_padded, P, current_block_size, DV);
+                } else
                 for (uint32_t j = 0; j < current_block_size; j += 2) {
                     if (j + 1 == current_block_size) {
                         HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
@@ -2404,6 +2410,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     struct htp_fa_context factx;
     factx.octx = octx;
+    factx.pv_regacc = kparams->pv_regacc != 0 && (v->ne[0] % 256) == 0;
     factx.k = k;
     factx.v = v;
 

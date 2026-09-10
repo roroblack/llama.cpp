@@ -105,6 +105,7 @@ static int    opt_mm_int_hmx = 0;      // 1 = use the integer HMX Q4_0 matmul wh
 static int    opt_mm_int_minrows = 32; // integer HMX only for MUL_MATs with at least this many rows
 static int    opt_mm_int_nc = 0;       // integer HMX consumer threads (0 = all HVX threads)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+static int    opt_fa_pvreg  = 0; // 1 = HVX flash-attn PV keeps the f32 accumulator in registers per K/V block
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -3593,6 +3594,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 
     kparams->qrows = q->ne[1] * q->ne[2] * q->ne[3];
     kparams->qrows_per_thread = (kparams->qrows + sess->n_threads - 1) / sess->n_threads;
+    kparams->pv_regacc = (opt_fa_pvreg && (DV % 256) == 0) ? 1 : 0;
 
     return true;
 }
@@ -6671,6 +6673,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_mm_chunk  = getenv("GGML_HEXAGON_MM_CHUNK");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
+    const char * str_fa_pvreg  = getenv("GGML_HEXAGON_FA_PVREG");
     const char * str_mm_int    = getenv("GGML_HEXAGON_INT_HMX");
     const char * str_mm_int_minrows = getenv("GGML_HEXAGON_INT_HMX_MINROWS");
     const char * str_mm_int_nc = getenv("GGML_HEXAGON_INT_HMX_NC");
@@ -6726,6 +6729,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_mm_chunk  = str_mm_chunk  ? atoi(str_mm_chunk)                    : opt_mm_chunk;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
+    opt_fa_pvreg  = str_fa_pvreg  ? atoi(str_fa_pvreg)                    : opt_fa_pvreg;
     opt_mm_int_hmx = str_mm_int   ? atoi(str_mm_int)                      : opt_mm_int_hmx;
     opt_mm_int_minrows = str_mm_int_minrows ? atoi(str_mm_int_minrows)    : opt_mm_int_minrows;
     opt_mm_int_nc = str_mm_int_nc ? atoi(str_mm_int_nc)                   : opt_mm_int_nc;

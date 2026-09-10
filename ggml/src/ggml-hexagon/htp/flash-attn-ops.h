@@ -80,6 +80,8 @@ struct htp_fa_kernel_params {
             struct fastdiv_values src0_div1;
         } hvx;
     } u;
+
+    uint8_t  pv_regacc;          // HVX: PV accumulator kept in registers per K/V block (bit-identical), appended
 };
 
 #if defined(__cplusplus)

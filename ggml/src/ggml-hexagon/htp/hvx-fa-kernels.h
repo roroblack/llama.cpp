@@ -280,6 +280,57 @@ static inline void hvx_mad_f32_f16_aa_rx2_vec(float * restrict y, const void * r
     }
 }
 
+// PV for one K/V block with the f32 accumulator held in registers, 4 vector pairs (256 floats) at a time.
+// The stream worker's loop calls hvx_mad_f32_f16_aa_rx2_vec per key pair, which loads and stores the whole
+// accumulator from VTCM every two keys. Here each element still receives exactly the same sequence of
+// hvx_vec_mpyacc_f32_f16 updates (key j, then j+1, ..., odd tail last), so the result is bit-identical;
+// only the accumulator round trips go away. Caller guarantees DV % 256 == 0.
+static inline void hvx_pv_block_regacc(float * restrict y, const uint8_t * restrict v_base, size_t v_stride,
+                                       HVX_Vector P, uint32_t nkeys, uint32_t DV) {
+    HVX_VectorPair * restrict vy_p = (HVX_VectorPair *) y;
+    const uint32_t npairs = DV / VLEN_FP16;  // one fp16 V vector <-> one f32 accumulator pair
+
+    for (uint32_t i0 = 0; i0 < npairs; i0 += 4) {
+        HVX_VectorPair a0 = vy_p[i0 + 0];
+        HVX_VectorPair a1 = vy_p[i0 + 1];
+        HVX_VectorPair a2 = vy_p[i0 + 2];
+        HVX_VectorPair a3 = vy_p[i0 + 3];
+
+        const uint8_t * v_ptr = v_base;
+        uint32_t j = 0;
+        for (; j + 1 < nkeys; j += 2) {
+            const HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
+            const HVX_Vector S1 = hvx_vec_repl_f16(Q6_V_vror_VR(P, (j + 1) * 2));
+            const HVX_Vector * vx0 = (const HVX_Vector *) v_ptr + i0;
+            const HVX_Vector * vx1 = (const HVX_Vector *) (v_ptr + v_stride) + i0;
+
+            a0 = hvx_vec_mpyacc_f32_f16(a0, Q6_Vh_vshuff_Vh(vx0[0]), S0);
+            a0 = hvx_vec_mpyacc_f32_f16(a0, Q6_Vh_vshuff_Vh(vx1[0]), S1);
+            a1 = hvx_vec_mpyacc_f32_f16(a1, Q6_Vh_vshuff_Vh(vx0[1]), S0);
+            a1 = hvx_vec_mpyacc_f32_f16(a1, Q6_Vh_vshuff_Vh(vx1[1]), S1);
+            a2 = hvx_vec_mpyacc_f32_f16(a2, Q6_Vh_vshuff_Vh(vx0[2]), S0);
+            a2 = hvx_vec_mpyacc_f32_f16(a2, Q6_Vh_vshuff_Vh(vx1[2]), S1);
+            a3 = hvx_vec_mpyacc_f32_f16(a3, Q6_Vh_vshuff_Vh(vx0[3]), S0);
+            a3 = hvx_vec_mpyacc_f32_f16(a3, Q6_Vh_vshuff_Vh(vx1[3]), S1);
+
+            v_ptr += 2 * v_stride;
+        }
+        if (j < nkeys) {  // odd block size: the last key alone, as hvx_mad_f32_f16_aa_vec does
+            const HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
+            const HVX_Vector * vx0 = (const HVX_Vector *) v_ptr + i0;
+            a0 = hvx_vec_mpyacc_f32_f16(a0, Q6_Vh_vshuff_Vh(vx0[0]), S0);
+            a1 = hvx_vec_mpyacc_f32_f16(a1, Q6_Vh_vshuff_Vh(vx0[1]), S0);
+            a2 = hvx_vec_mpyacc_f32_f16(a2, Q6_Vh_vshuff_Vh(vx0[2]), S0);
+            a3 = hvx_vec_mpyacc_f32_f16(a3, Q6_Vh_vshuff_Vh(vx0[3]), S0);
+        }
+
+        vy_p[i0 + 0] = a0;
+        vy_p[i0 + 1] = a1;
+        vy_p[i0 + 2] = a2;
+        vy_p[i0 + 3] = a3;
+    }
+}
+
 static inline void hvx_scale_vec_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, const uint32_t n, HVX_Vector vs) {
     assert((size_t) dst % 128 == 0);
     assert((size_t) src % 128 == 0);
