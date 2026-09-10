@@ -363,6 +363,15 @@ struct htp_hmx_selftest {
 // Integer HMX throughput - the go/no-go number for an integer MUL_MAT kernel.
 #define PERF_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
 #include "hmxperf.h"
+// Long-K correctness: K = 1024 in one packet vs 32 packets vs a scalar reference.
+#define BIGK_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxbigk.h"
+// Accumulator width: drive the sum across 2^31 and watch the sign.
+#define ACC_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxacc.h"
+// DDR<->VTCM bandwidth through the kernels' own DMA queue.
+#define DMA_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
+#include "hmxdma.h"
 
 // Which VTCM partitions exist, and how big? application_id selects the partition;
 // only id 0 had been queried before (8 MB).
@@ -431,6 +440,8 @@ static void htp_hmx_selftest_fn(void * data) {
     hmxconv_run(a->vtcm + 262144);
     htp_vtcm_partition_probe();
     hmxperf_run(a->vtcm + (1u << 20));
+    hmxbigk_run(a->vtcm + (2u << 20));
+    hmxacc_run(a->vtcm + (3u << 20));
 #endif
 }
 
@@ -715,6 +726,14 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
 
     void * wq_ptr = (void *) ((uintptr_t) block + offset_wq);
     ctx->work_queue = work_queue_init(wq_ptr, n_hvx, WORK_QUEUE_CAPACITY, WORK_QUEUE_STACK_SIZE);
+
+#if defined(HTP_DEBUG)
+    // The self test runs before the DMA queues exist, so the bandwidth probe runs here, on the
+    // cache-bypassing alias the matmul kernels use, in the upper half of VTCM.
+    vtcm_acquire(ctx);
+    hmxdma_run(ctx->dma[0], (uint8_t *) ctx->vtcm_base + (4u << 20), (size_t) 4u << 20);
+    vtcm_release(ctx);
+#endif
 
     ctx->main_stack = NULL;
     ctx->main_thread = 0;
