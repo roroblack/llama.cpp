@@ -384,6 +384,8 @@ struct htp_hmx_selftest {
 #include "hmxcomb.h"
 // Q4_0 block scale inside HMX's own converter: exactness, accuracy, cycles.
 #include "hmxscl.h"
+// Step 3: the calling thread holds the HMX lock and produces, work-queue workers combine.
+#include "hmxpipe.h"
 
 // Which VTCM partitions exist, and how big? application_id selects the partition;
 // only id 0 had been queried before (8 MB).
@@ -749,6 +751,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     // cache-bypassing alias the matmul kernels use, in the upper half of VTCM.
     vtcm_acquire(ctx);
     hmxdma_run(ctx->dma[0], (uint8_t *) ctx->vtcm_base + (4u << 20), (size_t) 4u << 20);
+    hmxpipe_run(ctx->vtcm_rctx, ctx->work_queue, ctx->n_threads, (unsigned char *) ctx->vtcm_base);
     vtcm_release(ctx);
 #endif
 
