@@ -17,12 +17,42 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
+#include <thread>
 #include <vector>
+
+#include <dirent.h>
+
+// Optional start barrier for concurrent-session runs (Codex q32 item 2): with ORACLE_BARRIER_DIR, ORACLE_ID
+// and ORACLE_PEERS set, every instance drops "<case>_<id>" into the directory right before computing a case
+// and waits (up to 60 s) until all peers have done the same, so the sessions really execute together.
+static void barrier_wait(const char * dir, const char * id, int case_idx, int peers) {
+    const std::string mine = std::string(dir) + "/" + std::to_string(case_idx) + "_" + id;
+    if (FILE * f = fopen(mine.c_str(), "w")) fclose(f);
+    const std::string prefix = std::to_string(case_idx) + "_";
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        int n = 0;
+        if (DIR * d = opendir(dir)) {
+            while (dirent * e = readdir(d)) {
+                if (strncmp(e->d_name, prefix.c_str(), prefix.size()) == 0) n++;
+            }
+            closedir(d);
+        }
+        if (n >= peers) return;
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) {
+            fprintf(stderr, "barrier: case %d waited 60 s for %d peers (saw %d)\n", case_idx, peers, n);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
 
 struct shape { int64_t m_out, n_act, k; };
 
@@ -97,9 +127,13 @@ int main(int argc, char ** argv) {
         { 1024, 256, 2048 }, { 1025, 256, 2048 }, { 2560, 256, 10240 }, {  33, 255, 2080 },
     };
     const double tol = 1e-5;   // relative to |y| + one block quantum (s_a * 256 * |sum d|)
-    std::mt19937 gen(42);
+    const char * barrier_dir = getenv("ORACLE_BARRIER_DIR");
+    const char * id          = getenv("ORACLE_ID") ? getenv("ORACLE_ID") : "a";
+    const int    peers       = getenv("ORACLE_PEERS") ? atoi(getenv("ORACLE_PEERS")) : 1;
+    // different inputs per instance, so a result that leaked from another session cannot pass
+    std::mt19937 gen(42 + (unsigned) id[0]);
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
-    int bad = 0;
+    int bad = 0, case_idx = 0;
 
     for (const shape & s : shapes) {
         std::vector<float> wf((size_t) (s.m_out * s.k)), x((size_t) (s.n_act * s.k));
@@ -118,6 +152,8 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
         ggml_backend_tensor_set(a, wq.data(), 0, wq.size());
         ggml_backend_tensor_set(b, x.data(), 0, x.size() * sizeof(float));
+        if (barrier_dir && peers > 1) barrier_wait(barrier_dir, id, case_idx, peers);
+        case_idx++;
         const ggml_status st = ggml_backend_graph_compute(backend, gf);
         std::vector<float> y((size_t) (s.m_out * s.n_act));
         ggml_backend_tensor_get(out, y.data(), 0, y.size() * sizeof(float));
@@ -126,9 +162,9 @@ int main(int argc, char ** argv) {
         const result tr = compare(y, wq, x, s, false, tol);
         const bool ok = st == GGML_STATUS_SUCCESS && (rn.over == 0 || tr.over == 0);
         bad += ok ? 0 : 1;
-        printf("m_out %5lld n_act %4lld k %5lld status %d | nearest: max_abs %.3g max_rel_row %.3g over %lld | "
+        printf("[%s] m_out %5lld n_act %4lld k %5lld status %d | nearest: max_abs %.3g max_rel_row %.3g over %lld | "
                "trunc: max_abs %.3g max_rel_row %.3g over %lld | NMSE vs exact %.3g | %s\n",
-               (long long) s.m_out, (long long) s.n_act, (long long) s.k, (int) st,
+               id, (long long) s.m_out, (long long) s.n_act, (long long) s.k, (int) st,
                rn.max_abs, rn.max_rel_row, (long long) rn.over, tr.max_abs, tr.max_rel_row, (long long) tr.over,
                rn.nmse_exact, ok ? "OK" : "MISMATCH");
         ggml_backend_buffer_free(buf);
