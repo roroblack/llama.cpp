@@ -307,6 +307,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build(test-hmx-int-oracle.cpp)   # device check for the Hexagon integer-HMX matmul (run by hand)
 
 # the tensor API kernels come from a separate metallib - check they produce correct results
 # ref: https://github.com/ggml-org/llama.cpp/issues/27473
