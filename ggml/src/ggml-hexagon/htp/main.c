@@ -396,6 +396,13 @@ struct htp_hmx_selftest {
 #include "hmxfp16.h"
 // fp16 HMX round 2: the MAC and output forms Qualcomm's own v73 fp16 kernels use (no :deep).
 #include "hmxfp16v2.h"
+// fp16 HMX round 3: sweep the output-conversion scale register (rounds 1-2 only ever tried 0..3).
+#include "hmxfp16v3.h"
+// fp16 HMX round 4: is the fp16 multiplier alive (read the accumulator via the integer store).
+#include "hmxfp16v4.h"
+// fp16 HMX record decode: the conversion record is a per-column-pair fp16 scale; the mxmem baseline is the
+// config the simulator computes correctly, so its device result decides H1 (convert disabled) vs H2 (my record).
+#include "hmxfp16rec.h"
 
 // Which VTCM partitions exist, and how big? application_id selects the partition;
 // only id 0 had been queried before (8 MB).
@@ -473,6 +480,9 @@ static void htp_hmx_selftest_fn(void * data) {
     hmxscl_run(a->vtcm + (6u << 20) + (512u << 10));
     hmxfp16_run(a->vtcm + (7u << 20));
     hmxfp16v2_run(a->vtcm + (7u << 20) + (512u << 10));
+    hmxfp16v3_run(a->vtcm + (7u << 20));
+    hmxfp16v4_run(a->vtcm + (7u << 20) + (512u << 10));
+    hmxfp16rec_run(a->vtcm + (7u << 20));
 #endif
 }
 
