@@ -114,6 +114,71 @@ static result compare(const std::vector<float> & y, const std::vector<uint8_t> &
     return r;
 }
 
+// Exact check of the integer semantics. Measured on the device (2026-09-14): the DSP truncates x * (32767 /
+// max|x|) toward zero (the truncation hypothesis fits ~5x better than nearest), but it forms that product in
+// qf32, which can land on the other side of an integer when the exact product is within a few ulp of it.
+// For such elements both integers are allowed; each block sum S_b - and QT_b = floor(S_b / 256) - then has a
+// small range, and y an interval. The device must land inside it, plus float-summation slack (tol relative to
+// the magnitude of the terms). Anything else - a wrong tile, block, segment, scale or row - lands far outside.
+static result compare_interval(const std::vector<float> & y, const std::vector<uint8_t> & wq, const std::vector<float> & x,
+                               const shape & s, double tol, int64_t * n_amb) {
+    const int64_t B = s.k / 32;
+    const size_t bsz = ggml_row_size(GGML_TYPE_Q4_0, 32);
+    result r = { 0.0, 0.0, 0.0, 0 };
+    std::vector<int32_t> qa(s.k), qb(s.k);   // the two candidate integers (equal when unambiguous)
+    int64_t amb = 0;
+    for (int64_t row = 0; row < s.n_act; row++) {
+        const float * xr = x.data() + row * s.k;
+        float m = 0.0f;
+        for (int64_t i = 0; i < s.k; i++) m = std::max(m, std::fabs(xr[i]));
+        const float sa  = m > 0.0f ? m / 32767.0f : 0.0f;
+        const float inv = m > 0.0f ? 32767.0f / m : 0.0f;
+        for (int64_t i = 0; i < s.k; i++) {
+            const double v = (double) xr[i] * (double) inv;
+            long t = (long) v, alt = (long) v;                       // truncation toward zero
+            const double n = std::nearbyint(v);
+            if (n != 0.0 && std::fabs(v - n) <= 4e-7 * std::max(1.0, std::fabs(v))) {
+                t   = (long) n;                                       // exact product on or above |n|
+                alt = v > 0 ? (long) n - 1 : (long) n + 1;            // qf32 product just below |n|
+                amb++;
+            }
+            qa[i] = (int32_t) std::min(32767L, std::max(-32767L, t));
+            qb[i] = (int32_t) std::min(32767L, std::max(-32767L, alt));
+        }
+        for (int64_t c = 0; c < s.m_out; c++) {
+            const uint8_t * wrow = wq.data() + (size_t) c * B * bsz;
+            double lo = 0.0, hi = 0.0, dsum = 0.0, mag = 0.0;
+            for (int64_t b = 0; b < B; b++) {
+                const uint8_t * blk = wrow + b * bsz;
+                uint16_t dh; memcpy(&dh, blk, 2);
+                const double d = fp16_to_f32(dh);
+                const uint8_t * qs = blk + 2;
+                int64_t smin = 0, smax = 0;
+                for (int j = 0; j < 32; j++) {
+                    const int w = (j < 16 ? (qs[j] & 0x0f) : (qs[j - 16] >> 4)) - 8;   // element j of the block
+                    const int64_t p0 = (int64_t) qa[b * 32 + j] * w, p1 = (int64_t) qb[b * 32 + j] * w;
+                    smin += std::min(p0, p1);
+                    smax += std::max(p0, p1);
+                }
+                auto fl = [](int64_t S) { return S >= 0 ? S / 256 : -((-S + 255) / 256); };
+                const double c0 = 256.0 * d * (double) fl(smin), c1 = 256.0 * d * (double) fl(smax);
+                lo  += std::min(c0, c1);
+                hi  += std::max(c0, c1);
+                mag += std::max(std::fabs(c0), std::fabs(c1));
+                dsum += d;
+            }
+            const double ylo = (double) sa * (lo + 128.0 * dsum), yhi = (double) sa * (hi + 128.0 * dsum);
+            const double slack = tol * (double) sa * (mag + 128.0 * std::fabs(dsum)) + 1e-30;
+            const double yd = y[(size_t) row * s.m_out + c];
+            const double out = yd < ylo - slack ? (ylo - slack) - yd : yd > yhi + slack ? yd - (yhi + slack) : 0.0;
+            if (out > 0.0) r.over++;
+            r.max_abs = std::max(r.max_abs, out);
+        }
+    }
+    *n_amb = amb;
+    return r;
+}
+
 int main(int argc, char ** argv) {
     const char * dev_name = argc > 1 ? argv[1] : "HTP0";
     ggml_backend_load_all();
@@ -168,12 +233,16 @@ int main(int argc, char ** argv) {
 
         const result rn = compare(y, wq, x, s, true, tol);
         const result tr = compare(y, wq, x, s, false, tol);
-        const bool ok = st == GGML_STATUS_SUCCESS && (rn.over == 0 || tr.over == 0);
+        int64_t amb = 0;
+        const result iv = compare_interval(y, wq, x, s, tol, &amb);
+        // the verdict is the exact interval check; the two point hypotheses are kept as diagnostics
+        const bool ok = st == GGML_STATUS_SUCCESS && iv.over == 0;
         bad += ok ? 0 : 1;
-        printf("[%s] m_out %5lld n_act %4lld k %5lld status %d | nearest: max_abs %.3g max_rel_row %.3g over %lld | "
-               "trunc: max_abs %.3g max_rel_row %.3g over %lld | NMSE vs exact %.3g | %s\n",
+        printf("[%s] m_out %5lld n_act %4lld k %5lld status %d | interval: outside %lld (by up to %.3g), ambiguous q %lld/%lld | "
+               "nearest: max_abs %.3g over %lld | trunc: max_abs %.3g over %lld | NMSE vs exact %.3g | %s\n",
                id, (long long) s.m_out, (long long) s.n_act, (long long) s.k, (int) st,
-               rn.max_abs, rn.max_rel_row, (long long) rn.over, tr.max_abs, tr.max_rel_row, (long long) tr.over,
+               (long long) iv.over, iv.max_abs, (long long) amb, (long long) (s.n_act * s.k),
+               rn.max_abs, (long long) rn.over, tr.max_abs, (long long) tr.over,
                rn.nmse_exact, ok ? "OK" : "MISMATCH");
         ggml_backend_buffer_free(buf);
         ggml_backend_buffer_free(buf_w);
