@@ -4988,6 +4988,59 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     }
 }
 
+// Integer-HMX extreme inputs (Codex q32): a Q4_0 x F32 MUL_MAT whose activations and weights carry
+// zero rows and zero blocks, outliers, a wide spread of row scales, or constant rows. The integer path
+// quantises each activation row to 16 bits with one scale and applies the Q4_0 block scales afterwards,
+// so these are its edge cases. Same reference (CPU) and tolerance as test_mul_mat.
+struct test_mul_mat_int_extreme : public test_mul_mat {
+    const int mode;  // 0 zero rows/blocks, 1 outliers, 2 row scales 1e-4 .. 1e4, 3 constant rows
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",extreme=" + std::to_string(mode);
+    }
+
+    test_mul_mat_int_extreme(int64_t m, int64_t n, int64_t k, int mode)
+        : test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}), mode(mode) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        static const float row_scale[9] = { 1e-4f, 1e-3f, 1e-2f, 1e-1f, 1.0f, 1e1f, 1e2f, 1e3f, 1e4f };
+        std::mt19937 gen(1234 + mode);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_Q4_0) continue;
+            const int64_t cols = t->ne[0], rows = ggml_nrows(t);
+            const bool is_w = t->type == GGML_TYPE_Q4_0;
+            std::vector<float> v((size_t) (cols * rows));
+            for (auto & x : v) x = u(gen);
+            for (int64_t r = 0; r < rows; r++) {
+                float * row = v.data() + r * cols;
+                if (mode == 0) {
+                    if (r % 7 == 3) std::fill(row, row + cols, 0.0f);
+                    if (is_w) {
+                        for (int64_t c = 0; c + 32 <= cols; c += 32) {
+                            if ((c / 32 + r) % 5 == 0) std::fill(row + c, row + c + 32, 0.0f);
+                        }
+                    }
+                } else if (mode == 1) {
+                    for (int64_t c = (r * 13) % 97; c < cols; c += 97) row[c] = ((c & 1) ? 1e4f : -1e4f) * (is_w ? 1e-2f : 1.0f);
+                } else if (mode == 2) {
+                    const float s = row_scale[r % 9];
+                    for (int64_t c = 0; c < cols; c++) row[c] *= s;
+                } else {
+                    std::fill(row, row + cols, (r % 2) ? 0.75f : -0.5f);
+                }
+            }
+            if (!is_w) {
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+            } else {
+                std::vector<uint8_t> q(ggml_row_size(t->type, cols) * rows);
+                ggml_quantize_chunk(t->type, v.data(), q.data(), 0, rows, cols, nullptr);
+                ggml_backend_tensor_set(t, q.data(), 0, q.size());
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -9944,6 +9997,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : {256, 257}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2560, n, 10240, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10752, n, 2560, {1, 1}, {1, 1}));
+        }
+        // extreme inputs on a column-tile path, a K-split path and a multi-segment K
+        for (int mode = 0; mode < 4; mode++) {
+            test_cases.emplace_back(new test_mul_mat_int_extreme(1536, 33, 1536, mode));
+            test_cases.emplace_back(new test_mul_mat_int_extreme(64, 256, 2048, mode));
+            test_cases.emplace_back(new test_mul_mat_int_extreme(96, 257, 12288, mode));
         }
     }
     for (ggml_type type_a : all_types) {
