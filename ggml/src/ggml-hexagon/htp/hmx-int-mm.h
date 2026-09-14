@@ -48,10 +48,31 @@ struct hmxi_job {
     atomic_int                 why;      // HMXI_WHY_*: what raised abort
     int                        fi_lock;  // fault injection armed for this group (producer side)
     int                        fi_cancel;
+    int                        fi_stall_ready, fi_stall_freed, fi_stall_worker, fi_stall_main;
 };
 
-#define HMXI_WHY_LOCK   1
-#define HMXI_WHY_CANCEL 2
+#define HMXI_WHY_LOCK    1
+#define HMXI_WHY_CANCEL  2
+#define HMXI_WHY_TIMEOUT 3
+
+// Codex q33a: a ring wait gives up after 2 s from its first check (checked every 256 spins, so the normal
+// path never reads the clock); it raises abort so the other side stops too.
+#define HMXI_RING_DEADLINE_US 2000000ull
+static inline int hmxi_wait_tick(struct hmxi_job * j, unsigned * spins, unsigned long long * t0) {
+    if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return 1;
+    if ((++*spins & 255) == 0) {
+        const unsigned long long now = HAP_perf_get_time_us();
+        if (*t0 == 0) {
+            *t0 = now;
+        } else if (now - *t0 > HMXI_RING_DEADLINE_US) {
+            atomic_store(&j->why, HMXI_WHY_TIMEOUT);
+            atomic_store(&j->abort, 1);
+            return 1;
+        }
+    }
+    hex_pause();
+    return 0;
+}
 
 // Fault injection (Codex q31): fires at most once per DSP session, at the point it names, so a case
 // that never reaches that point reports no FI_HIT instead of a false pass.
@@ -60,6 +81,21 @@ static int hmxi_fi_take(struct htp_context * ctx, int fi, int want, const char *
     ctx->hmxi_fi_fired = 1;
     FARF(ALWAYS, "FI_HIT int-hmx stage %s", stage);
     return 1;
+}
+
+// Codex q33a: every work-queue stage and the HMX pop have a 10 s deadline from submission. A timed-out
+// stage is left outstanding (its workers may still run), so the session is poisoned with
+// SESSION_POISONED and nothing - J, VTCM, the queues - may be reused; the host ends the process.
+#define HMXI_STAGE_DEADLINE_US 10000000ull
+static int hmxi_wq(struct htp_context * ctx, work_queue_func_t f, void * data, unsigned n, int not_submitted_rc) {
+    const int r = work_queue_run_timed(ctx->work_queue, f, data, n, HMXI_STAGE_DEADLINE_US);
+    if (r == WORK_QUEUE_OK) return 0;
+    if (r == WORK_QUEUE_TIMEOUT) {
+        atomic_store(&ctx->poisoned, HTP_STATUS_SESSION_POISONED);
+        FARF(ERROR, "int-hmx: a work-queue stage passed its deadline; workers not confirmed stopped, session poisoned");
+        return -12;
+    }
+    return not_submitted_rc;
 }
 
 static void hmxi_job_quant(unsigned int n, unsigned int i, void * data) {
@@ -113,13 +149,19 @@ static void hmxi_job_produce(void * data) {
         for (int sg = 0; sg < nseg; sg++) {
             const int s = jw * nseg + sg, slot = s % HMXI_DEPTH;
             if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;  // segment boundary
-            while ((int) atomic_load_explicit(&j->freed[w].v, memory_order_acquire) + HMXI_DEPTH <= s) {
-                if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;
-                hex_pause();
+            {
+                unsigned spins = 0; unsigned long long t0 = 0;
+                while ((int) atomic_load_explicit(&j->freed[w].v, memory_order_acquire) + HMXI_DEPTH <= s) {
+                    if (hmxi_wait_tick(j, &spins, &t0)) return;
+                }
             }
             const int b0 = sg * seg, nb = B - b0 < seg ? B - b0 : seg;
             hmxi_blocks(j->at + ((size_t) rt * B + b0) * 2048, j->wt + ((size_t) c * B + b0) * 1024,
                         j->ring + ((size_t) w * HMXI_DEPTH + slot) * seg * 2048, j->rec, nb);
+            if (j->fi_stall_ready) {  // fault injection: never publish; only an abort (consumers' deadline) ends it
+                while (!atomic_load_explicit(&j->abort, memory_order_relaxed)) hex_pause();
+                return;
+            }
             atomic_store_explicit(&j->ready[w].v, (unsigned) (s + 1), memory_order_release);
             if (j->fi_cancel) {  // fault injection "cancel": stop right after the first published segment
                 atomic_store(&j->why, HMXI_WHY_CANCEL);
@@ -136,13 +178,20 @@ static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
     const int B = j->L.B, nc = j->L.nc, nseg = j->L.nseg, seg = j->L.seg, w = (int) i;
     const int U = j->nct * j->n_rt;
     HVX_Vector * acc = j->accw + w * 32;
+    if ((j->fi_stall_worker && i == 1) || (j->fi_stall_main && i == 0)) {
+        // fault injection: a worker (stall_worker) or the calling thread itself (stall_main - job 0 runs on
+        // it, so no DSP deadline can see it; only the host's batch deadline ends it) that never returns
+        for (;;) hex_pause();
+    }
     for (int u = w; u < U; u += nc) {
         const int jw = u / nc, c = u / j->n_rt, rt = u % j->n_rt;
         for (int sg = 0; sg < nseg; sg++) {
             const int s = jw * nseg + sg, slot = s % HMXI_DEPTH;
-            while ((int) atomic_load_explicit(&j->ready[w].v, memory_order_acquire) <= s) {
-                if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;
-                hex_pause();
+            {
+                unsigned spins = 0; unsigned long long t0 = 0;
+                while ((int) atomic_load_explicit(&j->ready[w].v, memory_order_acquire) <= s) {
+                    if (hmxi_wait_tick(j, &spins, &t0)) return;
+                }
             }
             // an abort can arrive after this segment was already published: stop at the boundary
             if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;
@@ -150,6 +199,10 @@ static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
             const uint8_t * src = j->ring + ((size_t) w * HMXI_DEPTH + slot) * seg * 2048;
             hmxi_combine(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 0, nb, sg > 0);
             hmxi_combine(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 8, nb, sg > 0);
+            if (j->fi_stall_freed && w == 0) {  // fault injection: never release; only the producer's deadline ends it
+                while (!atomic_load_explicit(&j->abort, memory_order_relaxed)) hex_pause();
+                return;
+            }
             atomic_store_explicit(&j->freed[w].v, (unsigned) (s + 1), memory_order_release);
         }
         if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;  // no epilogue after an abort
@@ -208,22 +261,37 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
         J.m0 = m0; J.mr = m - m0 < J.L.mc ? m - m0 : J.L.mc; J.n_rt = (J.mr + 31) / 32;
         t0 = HAP_perf_get_pcycles();
         // fault injection replaces a submission by the "not submitted" result without running it
-        if (hmxi_fi_take(ctx, fi, HMXI_FI_QUANT, "quant") || !work_queue_run(ctx->work_queue, hmxi_job_quant, &J, ctx->n_threads)) return -7;
+        {
+            const int r = hmxi_fi_take(ctx, fi, HMXI_FI_QUANT, "quant") ? -7 : hmxi_wq(ctx, hmxi_job_quant, &J, ctx->n_threads, -7);
+            if (r) return r;
+        }
         tA += HAP_perf_get_pcycles() - t0;
         for (int ct0 = 0; ct0 < n_ct_all; ct0 += J.L.nct) {
             J.ct0 = ct0; J.nct = n_ct_all - ct0 < J.L.nct ? n_ct_all - ct0 : J.L.nct;
             t0 = HAP_perf_get_pcycles();
             if (J.nct < (int) ctx->n_threads) {
-                if (hmxi_fi_take(ctx, fi, HMXI_FI_CVT_K, "cvt_k") || !work_queue_run(ctx->work_queue, hmxi_job_cvt_k, &J, ctx->n_threads)) return -8;
+                const int r = hmxi_fi_take(ctx, fi, HMXI_FI_CVT_K, "cvt_k") ? -8 : hmxi_wq(ctx, hmxi_job_cvt_k, &J, ctx->n_threads, -8);
+                if (r) return r;
                 for (int c = 0; c < J.nct; c++) hmxi_mid_from_dv(J.dv + c * J.L.B, J.L.B, J.mid + c);
             } else {
-                if (hmxi_fi_take(ctx, fi, HMXI_FI_CVT, "cvt") || !work_queue_run(ctx->work_queue, hmxi_job_cvt, &J, ctx->n_threads)) return -8;
+                const int r = hmxi_fi_take(ctx, fi, HMXI_FI_CVT, "cvt") ? -8 : hmxi_wq(ctx, hmxi_job_cvt, &J, ctx->n_threads, -8);
+                if (r) return r;
             }
             tW += HAP_perf_get_pcycles() - t0;
             for (int w = 0; w < HMXI_MAXW; w++) { atomic_store(&J.ready[w].v, 0); atomic_store(&J.freed[w].v, 0); }
             atomic_store(&J.abort, 0);
             atomic_store(&J.why, 0);
-            J.fi_cancel = hmxi_fi_take(ctx, fi, HMXI_FI_CANCEL, "cancel");
+            J.fi_cancel      = hmxi_fi_take(ctx, fi, HMXI_FI_CANCEL, "cancel");
+            J.fi_stall_ready = hmxi_fi_take(ctx, fi, HMXI_FI_STALL_READY, "stall_ready");
+            J.fi_stall_freed = hmxi_fi_take(ctx, fi, HMXI_FI_STALL_FREED, "stall_freed");
+            J.fi_stall_worker = hmxi_fi_take(ctx, fi, HMXI_FI_STALL_WORKER, "stall_worker");
+            J.fi_stall_main   = hmxi_fi_take(ctx, fi, HMXI_FI_STALL_MAIN, "stall_main");
+            if (hmxi_fi_take(ctx, fi, HMXI_FI_STALL_RSP, "stall_rsp")) {
+                ctx->fi_skip_rsp = 1;   // this op completes, but its batch is never answered
+            }
+            if (hmxi_fi_take(ctx, fi, HMXI_FI_STALL_HMX_DONE, "stall_hmx_done")) {
+                ctx->hmx_queue->fi_stall_done = 1;   // the producer descriptor will never be marked done
+            }
             if (hmxi_fi_take(ctx, fi, HMXI_FI_LOCK, "lock")) {
                 // a real lock failure (Codex q32): the queue thread releases the lock (SUSPEND), and its
                 // next lock attempt - for this producer - returns an error without taking it
@@ -234,11 +302,16 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
             if (!hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmxi_job_produce, &J))) return -4;
             // If the consumers cannot be started the producer would fill the rings and spin: raise
             // abort so it returns, and still pop it before anything reuses this VTCM.
-            const bool consumed = hmxi_fi_take(ctx, fi, HMXI_FI_CONSUME, "consume") ? false
-                                : work_queue_run(ctx->work_queue, hmxi_job_consume, &J, (unsigned) J.L.nc);
-            if (!consumed) atomic_store(&J.abort, 1);
-            hmx_queue_pop(ctx->hmx_queue);
-            if (!consumed) {
+            const int crc = hmxi_fi_take(ctx, fi, HMXI_FI_CONSUME, "consume") ? -9
+                          : hmxi_wq(ctx, hmxi_job_consume, &J, (unsigned) J.L.nc, -9);
+            if (crc != 0) atomic_store(&J.abort, 1);
+            if (!hmx_queue_pop_timed(ctx->hmx_queue, HMXI_STAGE_DEADLINE_US)) {
+                atomic_store(&ctx->poisoned, HTP_STATUS_SESSION_POISONED);
+                FARF(ERROR, "int-hmx: the producer descriptor passed its deadline; not confirmed done, session poisoned");
+                return -12;
+            }
+            if (crc == -12) return -12;
+            if (crc != 0) {
                 FARF(ERROR, "int-hmx: consumer launch failed; producer aborted and drained");
                 return -9;
             }
@@ -247,6 +320,13 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
                 if (atomic_load(&J.why) == HMXI_WHY_CANCEL) {
                     FARF(ERROR, "int-hmx: cancelled; producer and consumers stopped at a segment boundary");
                     return -10;
+                }
+                if (atomic_load(&J.why) == HMXI_WHY_TIMEOUT) {
+                    // every consumer has returned (work_queue_run) and the producer was popped: drained.
+                    // The session stays poisoned; later batches are refused before touching J or VTCM.
+                    atomic_store(&ctx->poisoned, HTP_STATUS_TIMEOUT_DRAINED);
+                    FARF(ERROR, "int-hmx: ring wait passed its deadline; producer and consumers stopped, session poisoned");
+                    return -11;
                 }
                 FARF(ERROR, "int-hmx: the HMX queue thread does not hold the HMX lock; not issuing HMX");
                 return -5;

@@ -3450,7 +3450,11 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
 
     if (ret != 0) {
         FARF(ERROR, "HMX matmul failed (ret=%d)\n", ret);
-        return HTP_STATUS_INTERNAL_ERR;
+        // -11: a ring wait passed its deadline and every worker was seen to stop (session now poisoned)
+        // -12: a work-queue stage or the HMX descriptor passed its deadline, workers not confirmed stopped
+        return ret == -11 ? HTP_STATUS_TIMEOUT_DRAINED
+             : ret == -12 ? HTP_STATUS_SESSION_POISONED
+                          : HTP_STATUS_INTERNAL_ERR;
     }
     return HTP_STATUS_OK;
 }

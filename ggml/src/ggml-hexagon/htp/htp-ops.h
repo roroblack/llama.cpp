@@ -11,6 +11,11 @@ enum htp_status {
     HTP_STATUS_NO_SUPPORT     = 3,
     HTP_STATUS_INVAL_PARAMS   = 4,
     HTP_STATUS_VTCM_TOO_SMALL = 5,
+    // Codex q33a deadlines: 6 = a wait timed out and every worker was seen to stop (the session is poisoned,
+    // later batches are refused); 7 = a wait timed out and the workers could not be confirmed stopped
+    // (nothing may be reused: the host must end the process).
+    HTP_STATUS_TIMEOUT_DRAINED  = 6,
+    HTP_STATUS_SESSION_POISONED = 7,
 };
 
 // First set of values must match the ggml_type.

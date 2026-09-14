@@ -95,6 +95,8 @@ struct htp_context {
     uint32_t               hmx_int_status;
     void *                 hmxi_job;          // integer-HMX matmul job state (hmx-int-mm.h), per context
     uint32_t               hmxi_fi_fired;     // integer-HMX fault injection already fired in this session
+    atomic_int             poisoned;          // 0, or the HTP_STATUS_* a deadline left the session in (never cleared)
+    volatile int           fi_skip_rsp;       // fault injection (stall_rsp): do not answer the current batch
     bool                   etm;
     uint32_t               profiler;
     struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];

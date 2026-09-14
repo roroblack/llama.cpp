@@ -30,6 +30,13 @@ static inline bool work_queue_run(work_queue_t q, work_queue_func_t func, void *
     return work_queue_run_async(q, func, data, n);
 }
 
+// Codex q33a: the same, with a deadline on waiting for the workers (measured from submission). On
+// WORK_QUEUE_TIMEOUT the task is left outstanding - its workers may still be running it - so nothing it
+// touches may be reused; the caller must poison its session. Job 0 runs on the calling thread and is not
+// covered: if it never returns, only the host's deadline can end the batch.
+enum { WORK_QUEUE_OK = 0, WORK_QUEUE_NOT_SUBMITTED = 1, WORK_QUEUE_TIMEOUT = 2 };
+int work_queue_run_timed(work_queue_t q, work_queue_func_t func, void * data, unsigned int n, uint64_t deadline_us);
+
 // Legacy compatibility
 typedef work_queue_func_t     worker_callback_t;
 #define worker_pool_run_func  work_queue_run

@@ -62,6 +62,10 @@ static inline void hmx_queue_process(hmx_queue_t q, bool* killed) {
                     htp_trace_event_start(q->trace, HTP_TRACE_EVT_HMX_COMP, ir);
                     d->func(d->data);
                     htp_trace_event_stop(q->trace, HTP_TRACE_EVT_HMX_COMP, ir);
+                    if (q->fi_stall_done) {
+                        // fault injection (GGML_HEXAGON_INT_HMX_FI=stall_hmx_done): never mark it done
+                        for (;;) hex_pause();
+                    }
                     break;
             }
 

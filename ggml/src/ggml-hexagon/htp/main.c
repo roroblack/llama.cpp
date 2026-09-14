@@ -1318,6 +1318,14 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     prep_op_bufs(ctx, bufs, n_bufs);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
 
+    // Codex q33a: a session that hit a deadline stays poisoned; later batches are refused before any
+    // tensor preparation or VTCM/queue use, and answered with the poison status.
+    const int poison = atomic_load(&ctx->poisoned);
+    int op_status = HTP_STATUS_OK;
+    if (poison) {
+        op_status = poison;
+        FARF(ERROR, "batch refused: session poisoned (status %d)", poison);
+    } else {
     prep_tensors(ctx, bufs, tens, n_tens);
 
     struct htp_ops_context *octx = &ctx->octx;
@@ -1330,7 +1338,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         hmx_queue_wakeup(ctx->hmx_queue);
     }
 
-    int op_status = HTP_STATUS_OK;
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
 
@@ -1351,11 +1358,13 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         }
     }
 
-    if (ctx->hmx_queue) {
+    // Codex q33a: with workers not confirmed stopped nothing may wait on or reuse their descriptors
+    if (ctx->hmx_queue && atomic_load(&ctx->poisoned) != HTP_STATUS_SESSION_POISONED) {
         hmx_queue_suspend(ctx->hmx_queue);
         hmx_queue_flush(ctx->hmx_queue);
     }
     work_queue_suspend(ctx->work_queue);
+    }  // !poison
 
     // Flush remaining dirty tensors at the end of the batch
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
@@ -1380,6 +1389,14 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
             rsp.n_traces[t] = ctx->trace[t].count;
         }
+    }
+
+    if (ctx->fi_skip_rsp) {
+        // fault injection (GGML_HEXAGON_INT_HMX_FI=stall_rsp): the batch completed but is never answered;
+        // only the host's batch deadline can end it
+        ctx->fi_skip_rsp = 0;
+        FARF(ALWAYS, "FI: response for batch %u suppressed", (unsigned) req->id);
+        return;
     }
 
     struct dspqueue_buffer write_dbuf = *dbuf;
@@ -1436,7 +1453,10 @@ static void process_ops(struct htp_context * ctx) {
         process_opbatch(ctx, &req, &dbuf);
     }
 
-    vtcm_release(ctx);
+    // Codex q33a: workers that may still be running keep their VTCM
+    if (atomic_load(&ctx->poisoned) != HTP_STATUS_SESSION_POISONED) {
+        vtcm_release(ctx);
+    }
 }
 
 static void htp_packet_callback(dspqueue_t queue, int error, void * context) {

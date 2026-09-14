@@ -136,6 +136,57 @@ bool work_queue_run_async(work_queue_t q, work_queue_func_t func, void * data, u
     return true;
 }
 
+#include <HAP_perf.h>
+
+int work_queue_run_timed(work_queue_t q, work_queue_func_t func, void * data, unsigned int n, uint64_t deadline_us) {
+    if (n <= 1) {
+        func(n, 0, data);
+        return WORK_QUEUE_OK;
+    }
+    if (n > q->n_threads) {
+        FARF(ERROR, "work-queue: invalid number of jobs %u for n-threads %u", n, q->n_threads);
+        return WORK_QUEUE_NOT_SUBMITTED;
+    }
+
+    unsigned int ir = atomic_load_explicit(&q->idx_read, memory_order_relaxed);
+    unsigned int iw = q->idx_write;
+
+    if (((iw + 1) & q->idx_mask) == ir) {
+        FARF(ERROR, "work-queue-push: queue is full\n");
+        return WORK_QUEUE_NOT_SUBMITTED;
+    }
+
+    const uint64_t t0 = HAP_perf_get_time_us();
+
+    struct work_queue_task_s * task = &q->queue[iw];
+    task->func      = func;
+    task->data      = data;
+    task->n_threads = n;
+    atomic_store_explicit(&task->barrier, n, memory_order_relaxed);
+
+    q->idx_write = (iw + 1) & q->idx_mask;
+    atomic_fetch_add_explicit(&q->seqn, 1, memory_order_release);
+
+    func(n, 0, data);
+
+    atomic_fetch_sub_explicit(&task->barrier, 1, memory_order_release);
+
+    unsigned int spins = 0;
+    while (atomic_load_explicit(&task->barrier, memory_order_relaxed) > 0) {
+        if ((++spins & 255) == 0 && HAP_perf_get_time_us() - t0 > deadline_us) {
+            // leave idx_read where it is: the task still belongs to the workers that have not returned
+            FARF(ERROR, "work-queue: %u worker(s) still in the task %llu us after submission; left outstanding",
+                 atomic_load_explicit(&task->barrier, memory_order_relaxed), (unsigned long long) deadline_us);
+            return WORK_QUEUE_TIMEOUT;
+        }
+        hex_pause();
+    }
+
+    atomic_thread_fence(memory_order_acquire);
+    atomic_store_explicit(&q->idx_read, (ir + 1) & q->idx_mask, memory_order_relaxed);
+    return WORK_QUEUE_OK;
+}
+
 size_t work_queue_sizeof(uint32_t n_threads, uint32_t capacity, uint32_t stack_size) {
     capacity = hex_ceil_pow2(capacity);
     uint32_t n_workers = n_threads > 1 ? n_threads - 1 : 0;

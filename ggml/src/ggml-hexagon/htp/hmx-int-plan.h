@@ -28,6 +28,12 @@ struct hmxi_layout {
 #define HMXI_FI_VTCM_PLAN  6   // planner given a 1-byte budget                   -> -3
 #define HMXI_FI_VTCM_SHORT 7   // usable VTCM one byte short of the plan          -> -3
 #define HMXI_FI_CANCEL     8   // producer aborts after the first published segment -> -10
+#define HMXI_FI_STALL_READY 9  // producer never publishes a segment: consumers' ring deadline -> -11 (status 6)
+#define HMXI_FI_STALL_FREED 10 // consumer 0 never releases a slot: producer's ring deadline -> -11 (status 6)
+#define HMXI_FI_STALL_WORKER 11   // worker 1 never returns: work-queue deadline -> -12 (status 7, host aborts)
+#define HMXI_FI_STALL_HMX_DONE 12 // HMX descriptor never marked done: pop deadline -> -12 (status 7, host aborts)
+#define HMXI_FI_STALL_MAIN     13 // job 0 on the calling thread never returns: only the host batch deadline ends it
+#define HMXI_FI_STALL_RSP      14 // the batch completes but is never answered: host batch deadline
 
 // k = K (multiple of 32), m = activation rows, n = output columns, nc = consumers, vtcm = bytes,
 // seg_cap = blocks per K segment (0 = HMXI_SEG). Host and DSP must pass the same seg_cap.

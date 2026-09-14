@@ -9,6 +9,7 @@
 #include <qurt_thread.h>
 #include <qurt_futex.h>
 #include <HAP_farf.h>
+#include <HAP_perf.h>
 
 #include "hex-utils.h"
 #include "hex-profile.h"
@@ -37,6 +38,7 @@ struct hmx_queue_desc {
     hmx_queue_func   func;
     void *           data;
     atomic_uint      done;
+    uint64_t         t_us;      // push time (HAP_perf_get_time_us), for hmx_queue_pop_timed
 };
 
 struct hmx_queue_s {
@@ -53,6 +55,7 @@ struct hmx_queue_s {
     uint32_t         hap_rctx;
     bool             hmx_locked;
     volatile int     fi_lock_fail; // fault injection (test only): the next lock attempt fails, one shot
+    volatile int     fi_stall_done; // fault injection (test only): the next descriptor is never marked done
     struct htp_thread_trace * trace;
     bool             external_mem; // memory owned externally
 };
@@ -79,6 +82,7 @@ static inline bool hmx_queue_push(hmx_queue_t q, struct hmx_queue_desc d) {
     }
 
     atomic_store(&d.done, 0);
+    d.t_us = HAP_perf_get_time_us();
 
     FARF(HIGH, "hmx-queue-push: iw %u func %p data %p\n", iw, d.func, d.data);
 
@@ -139,6 +143,34 @@ static inline struct hmx_queue_desc hmx_queue_pop(hmx_queue_t q) {
             continue;
 
         return d;
+    }
+}
+
+// Codex q33a: like hmx_queue_pop (signals are skipped), but gives up when a descriptor is still not done
+// deadline_us after it was pushed. The descriptor is then left in place (idx_pop not advanced) and false is
+// returned: whatever it uses may still be touched by the HMX queue thread.
+static inline bool hmx_queue_pop_timed(hmx_queue_t q, uint64_t deadline_us) {
+    for (;;) {
+        unsigned int ip = q->idx_pop;
+        if (ip == atomic_load(&q->idx_write)) {
+            return true;
+        }
+        struct hmx_queue_desc * d = &q->desc[ip];
+        unsigned int spins = 0;
+        while (!atomic_load(&d->done)) {
+            if ((++spins & 255) == 0 && HAP_perf_get_time_us() - d->t_us > deadline_us) {
+                FARF(ERROR, "hmx-queue-pop: descriptor %u still not done %llu us after push; left in place",
+                     ip, (unsigned long long) deadline_us);
+                return false;
+            }
+            hex_pause();
+        }
+        const uint32_t sig = (uint32_t) d->func;
+        q->idx_pop = (ip + 1) & q->idx_mask;
+        if (sig && sig <= HMX_QUEUE_KILL) {
+            continue;
+        }
+        return true;
     }
 }
 

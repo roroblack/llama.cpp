@@ -108,6 +108,7 @@ static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = C
 static int    opt_fa_pvreg  = 0; // 1 = HVX flash-attn PV keeps the f32 accumulator in registers per K/V block
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
 static int    opt_async_status = 0; // 1 = graph_compute returns before its batches finish (old behaviour)
+static int    opt_batch_deadline_s = 60; // a DSP batch unanswered this long ends the process (Codex q33a)
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -152,6 +153,10 @@ static const char * status_to_str(uint32_t status) {
             return "VTCM-TOO-SMALL";
         case HTP_STATUS_INTERNAL_ERR:
             return "INTERNAL-ERROR";
+        case HTP_STATUS_TIMEOUT_DRAINED:
+            return "TIMEOUT-DRAINED";
+        case HTP_STATUS_SESSION_POISONED:
+            return "SESSION-POISONED";
         default:
             return "UNKNOWN";
     }
@@ -399,6 +404,7 @@ struct ggml_hexagon_session {
 
     std::atomic<int>      op_pending;
     std::atomic<int>      op_failed{0};   // DSP batches that answered with an error, not yet reported
+    std::deque<std::chrono::steady_clock::time_point> batch_t;  // submit time of each batch still unanswered
     ggml_hexagon_opbatch* op_batch;
     ggml_hexagon_opqueue* op_queue;
 
@@ -2752,10 +2758,21 @@ void ggml_hexagon_session::flush_pending(bool all) {
         uint32_t               n_dbufs;
 
         // Read response packet from queue
-        const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
+        // Codex q33a: never block longer than 100 ms (DSPQUEUE_TIMEOUT may be "none"), so the batch deadline
+        // below is checked even when the DSP never answers.
+        const uint32_t timeo = opt_oppoll ? 0 : 100000;
 
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
         if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+            // Codex q33a: the host is the last supervisor (a job stuck on the DSP's calling thread, or a
+            // response that never comes, is invisible to the DSP's own deadlines). Measured from the
+            // oldest unanswered batch's submission; retries do not extend it. Nothing of this session may
+            // be reused, so the process ends.
+            if (!batch_t.empty() &&
+                std::chrono::steady_clock::now() - batch_t.front() > std::chrono::seconds(opt_batch_deadline_s)) {
+                GGML_ABORT("ggml-hex: %s: no answer to a DSP batch within %d s; ending the process\n",
+                           this->c_name(), opt_batch_deadline_s);
+            }
             continue;
         }
 
@@ -2772,9 +2789,15 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
             // Remember it: graph_compute reports GGML_STATUS_FAILED instead of silently succeeding.
             this->op_failed++;
+            if (rsp.status == HTP_STATUS_SESSION_POISONED) {
+                // Codex q33a: DSP workers could not be confirmed stopped; nothing of this session may be
+                // reused, not even by teardown. End the process.
+                GGML_ABORT("ggml-hex: %s: DSP session poisoned with workers not confirmed stopped\n", this->c_name());
+            }
         }
 
         op_queue->pop(rsp, dbuf);
+        if (!batch_t.empty()) batch_t.pop_front();
 
         this->op_pending--;  // atomic dec
 
@@ -2802,6 +2825,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
+    batch_t.push_back(std::chrono::steady_clock::now());
 }
 
 void ggml_hexagon_session::flush(bool all) {
@@ -6746,11 +6770,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_pvreg  = str_fa_pvreg  ? atoi(str_fa_pvreg)                    : opt_fa_pvreg;
     if (const char * s = getenv("GGML_HEXAGON_ASYNC_STATUS")) { opt_async_status = atoi(s); }
+    if (const char * s = getenv("GGML_HEXAGON_BATCH_DEADLINE_S")) { opt_batch_deadline_s = std::max(1, atoi(s)); }
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_FI")) {
         static const struct { const char * name; int code; } fi_names[] = {
             { "lock", HMXI_FI_LOCK }, { "quant", HMXI_FI_QUANT }, { "cvt", HMXI_FI_CVT }, { "cvt_k", HMXI_FI_CVT_K },
             { "consume", HMXI_FI_CONSUME }, { "vtcm_plan", HMXI_FI_VTCM_PLAN }, { "vtcm_short", HMXI_FI_VTCM_SHORT },
-            { "cancel", HMXI_FI_CANCEL },
+            { "cancel", HMXI_FI_CANCEL }, { "stall_ready", HMXI_FI_STALL_READY }, { "stall_freed", HMXI_FI_STALL_FREED },
+            { "stall_worker", HMXI_FI_STALL_WORKER }, { "stall_hmx_done", HMXI_FI_STALL_HMX_DONE },
+            { "stall_main", HMXI_FI_STALL_MAIN }, { "stall_rsp", HMXI_FI_STALL_RSP },
         };
         opt_mm_int_fi = -1;
         for (const auto & f : fi_names) {
