@@ -4643,6 +4643,15 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
                 return false;  // no broadcasting (for now)
             }
 
+            // The quantized paths repack and read the weights as back-to-back rows and the activations as
+            // packed rows. A padded-row view (e.g. k = 2048 inside rows of 2080) was accepted and came back
+            // wrong on the HVX path with and without integer HMX (ERR ~1.0, found by the Codex q34 layout
+            // cases). Leave such layouts to the CPU.
+            if (!ggml_is_contiguous(src0) ||
+                src1->nb[0] != ggml_type_size(src1->type) || src1->nb[1] != src1->ne[0] * src1->nb[0]) {
+                return false;
+            }
+
             if (!src0->buffer) {
                 sess->needs_repack.insert(src0);
             }
