@@ -279,6 +279,8 @@ static int run_fallback(ggml_backend_t htp, std::mt19937 & gen) {
             std::vector<float> y[2];
             ggml_status st[2] = { GGML_STATUS_FAILED, GGML_STATUS_FAILED };
             std::string placed = "?";
+            int htp_supports = -1;   // the HTP backend's own answer for this node (the placement alone does not
+                                     // discriminate: with the weights in a CPU buffer the control lands on the CPU too)
             for (int run = 0; run < 2; run++) {   // 0: scheduler HTP + CPU, 1: CPU only
                 ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
                 ggml_context * ctx = ggml_init(ip);
@@ -293,6 +295,7 @@ static int run_fallback(ggml_backend_t htp, std::mt19937 & gen) {
                 ggml_backend_tensor_set(A, wq.data(), 0, wq.size());
                 ggml_backend_tensor_set(Bt, x.data(), 0, x.size() * sizeof(float));
                 if (run == 0) {
+                    htp_supports = ggml_backend_supports_op(htp, out) ? 1 : 0;
                     ggml_backend_t backs[2] = { htp, cpu };
                     ggml_backend_sched_t sched = ggml_backend_sched_new(backs, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
                     if (ggml_backend_sched_alloc_graph(sched, gf)) {
@@ -316,11 +319,14 @@ static int run_fallback(ggml_backend_t htp, std::mt19937 & gen) {
                 max_abs = std::max(max_abs, (double) std::fabs(y[0][i] - y[1][i]));
             }
             const bool on_cpu = placed == ggml_backend_name(cpu);
+            // padded: the HTP backend must refuse the node itself, the node must run on the CPU and equal the CPU-only run
             const bool ok = kv == k ? (st[0] == GGML_STATUS_SUCCESS && finite)      // control: placement reported only
-                                    : (st[0] == GGML_STATUS_SUCCESS && st[1] == GGML_STATUS_SUCCESS && on_cpu && finite && max_abs == 0.0);
+                                    : (st[0] == GGML_STATUS_SUCCESS && st[1] == GGML_STATUS_SUCCESS && htp_supports == 0 &&
+                                       on_cpu && finite && max_abs == 0.0);
             bad += ok ? 0 : 1;
-            printf("[fallback] m %lld n %lld k %lld rows %lld (%s) | placed on %s | status %d/%d | max |sched - cpu| %.3g | %s\n",
+            printf("[fallback] m %lld n %lld k %lld rows %lld (%s) | HTP supports_op %s | placed on %s | status %d/%d | max |sched - cpu| %.3g | %s\n",
                    (long long) m, (long long) n, (long long) k, (long long) kv, kv == k ? "contiguous control" : "padded",
+                   htp_supports == 1 ? "yes" : htp_supports == 0 ? "no" : "?",
                    placed.c_str(), (int) st[0], (int) st[1], max_abs, ok ? "OK" : "MISMATCH");
         }
     }
