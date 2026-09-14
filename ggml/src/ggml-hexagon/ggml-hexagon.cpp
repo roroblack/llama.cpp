@@ -101,8 +101,10 @@ static int    opt_mm_chunk  = 2; // 0 = refuse a MUL_MAT whose activation block 
                                  //     mode 1 18.68 +/- 0.63 t/s, mode 2 31.42 +/- 1.01.
                                  //     MUL_MAT stays 556/556 either way.
 static int    opt_mm_int_hmx = 1;      // integer HMX Q4_0 matmul where the DSP's integer self test passed (default on,
-                                        // Codex q34/q36; verified on SM8735 only); GGML_HEXAGON_INT_HMX=0 turns it off
-                                       // (parts whose fp16 HMX does not compute, e.g. SM8735 / v73)
+                                        // Codex q34/q36/q37; validated on SM8735 v73, SINGLE session only - two large
+                                        // sessions sharing the one DSP can hit the batch deadline, so run one session
+                                        // per HTP; GGML_HEXAGON_INT_HMX=0 turns it off. These are parts whose fp16 HMX
+                                        // does not compute, e.g. SM8735 / v73)
 static int    opt_mm_int_minrows = 32; // integer HMX only for MUL_MATs with at least this many rows
 static int    opt_mm_int_nc = 0;       // integer HMX consumer threads (0 = all HVX threads)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
