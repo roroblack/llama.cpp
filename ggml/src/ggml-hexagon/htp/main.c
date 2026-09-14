@@ -1301,8 +1301,12 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     struct profile_data batch_prof;
     profile_start(HTP_PROF_BASIC, &batch_prof);
 
-    memset(ctx->trace, 0, sizeof(ctx->trace));
-    if (ctx->profiler == HTP_PROF_TRACE) {
+    // Codex q36: a poisoned session does not even reset the trace state (see the refusal below)
+    const bool poisoned_at_entry = atomic_load(&ctx->poisoned) != 0;
+    if (!poisoned_at_entry) {
+        memset(ctx->trace, 0, sizeof(ctx->trace));
+    }
+    if (!poisoned_at_entry && ctx->profiler == HTP_PROF_TRACE) {
         struct htp_trace_desc * trace_events = (struct htp_trace_desc *) (m_ptr + p_size);
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
             ctx->trace[t].events     = &trace_events[t * req->n_traces];
@@ -1395,7 +1399,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.cycles_stop  = batch_prof.cycles_stop;
     rsp.seq          = req->seq;
 
-    if (ctx->profiler == HTP_PROF_TRACE) {
+    if (!poisoned_at_entry && ctx->profiler == HTP_PROF_TRACE) {   // not reset while poisoned: report none
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
             rsp.n_traces[t] = ctx->trace[t].count;
         }

@@ -2807,7 +2807,25 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
 
         op_queue->pop(rsp, dbuf);
-        if (!batch_t.empty()) batch_t.pop_front();
+        if (!batch_t.empty()) {
+            // GGML_HEXAGON_BATCH_STATS=1 (Codex q36): submission-attempt -> answer latency of every batch, to size
+            // the batch deadline against the slowest normal batch
+            static const bool batch_stats = getenv("GGML_HEXAGON_BATCH_STATS") != nullptr;
+            if (batch_stats) {
+                static double   lat_max_ms = 0.0, lat_sum_ms = 0.0;
+                static uint64_t lat_n = 0;
+                static uint32_t pend_max = 0;
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - batch_t.front()).count();
+                lat_max_ms = std::max(lat_max_ms, ms);
+                lat_sum_ms += ms;
+                pend_max = std::max(pend_max, (uint32_t) batch_t.size());
+                if (++lat_n % 200 == 0) {
+                    GGML_LOG_INFO("ggml-hex: %s batch stats: n %llu max %.1f ms mean %.2f ms max-pending %u\n", this->c_name(),
+                                  (unsigned long long) lat_n, lat_max_ms, lat_sum_ms / (double) lat_n, pend_max);
+                }
+            }
+            batch_t.pop_front();
+        }
 
         this->op_pending--;  // atomic dec
 
@@ -2849,7 +2867,10 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         if (err != AEE_EEXPIRED && err != AEE_EWOULDBLOCK) {
             break;
         }
-        if (std::chrono::steady_clock::now() - t_submit > std::chrono::seconds(opt_batch_deadline_s)) {
+        // Codex q36: whichever expires first - this batch's submission or the oldest batch still unanswered
+        const auto now = std::chrono::steady_clock::now();
+        const auto oldest = batch_t.empty() ? t_submit : std::min(t_submit, batch_t.front());
+        if (now - oldest > std::chrono::seconds(opt_batch_deadline_s)) {
             GGML_ABORT("ggml-hex: %s: could not submit a DSP batch within %d s; ending the process\n",
                        this->c_name(), opt_batch_deadline_s);
         }
@@ -3403,7 +3424,9 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             // bit 0: the fp16 self test computed 32.0; bit 1: the integer self test was exact.
             // An old host reading bit 1 alone would enable the fp16 paths - deploy host and DSP together.
             const bool fp16_ok = (v_hmx & 1u) != 0;
-            const bool int_ok  = (v_hmx & 2u) != 0;
+            // test only (Codex q36): GGML_HEXAGON_FI_INT_SELFTEST_FAIL treats the DSP's integer self test as
+            // failed at the point where the host decodes it, to check the path is then never selected
+            const bool int_ok  = (v_hmx & 2u) != 0 && getenv("GGML_HEXAGON_FI_INT_SELFTEST_FAIL") == nullptr;
             this->int_hmx = int_ok && opt_nhmx != 0 && hw_has_hmx;
             if (int_ok) {
                 GGML_LOG_INFO("ggml-hex: %s integer HMX self test passed; integer Q4_0 matmul %s\n", this->c_name(),

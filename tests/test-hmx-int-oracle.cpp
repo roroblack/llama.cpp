@@ -13,9 +13,15 @@
 // activations to Q8_0. Their single output is checked against a deterministic error bound instead of an NMSE
 // (Codex q34: a one-value NMSE fails whenever the dot product lands near zero).
 //
+// Finally, padded-row layouts (k = 2048 inside rows of 2080), which the Hexagon backend refuses, are run end
+// to end through a CPU+HTP scheduler: they must be placed on the CPU, succeed, and equal a CPU-only run of the
+// same graph (Codex q36).
+//
 // usage: test-hmx-int-oracle [device, default HTP0]   (set GGML_HEXAGON_INT_HMX=1 to use the integer path)
 //   ORACLE_BARRIER_DIR / ORACLE_ID / ORACLE_PEERS   start barrier for concurrent sessions (timeout = failure)
-//   ORACLE_INJECT=nan|inf|ninf                      corrupt one output of every case; every case must then fail
+//   ORACLE_INJECT=nan|inf|ninf|bound|ref            self-test: corrupt one output (nan/inf/ninf), one error
+//                                                   bound or one reference interval (bound/ref); every device
+//                                                   case must then fail
 // Exit code 0 when every case passes.
 
 #include "ggml.h"
@@ -35,10 +41,15 @@
 
 #include <dirent.h>
 
+// ORACLE_INJECT=bound / ref: poison the first bound / reference interval inside the verdict functions
+static bool g_inject_bound = false;
+static bool g_inject_ref   = false;
+
 // Optional start barrier for concurrent-session runs (Codex q32 item 2): with ORACLE_BARRIER_DIR, ORACLE_ID
 // and ORACLE_PEERS set, every instance drops "<case>_<id>" into the directory right before computing a case
 // and waits (up to 60 s) until all peers have done the same. It aligns the submissions; it does not prove the
-// DSP executions overlapped. A timeout is returned as false and fails the case (Codex q34).
+// DSP executions overlapped. Use a fresh directory per run (files are not removed). A timeout is returned as
+// false and fails the case (Codex q34).
 static bool barrier_wait(const char * dir, const char * id, int case_idx, int peers) {
     const std::string mine = std::string(dir) + "/" + std::to_string(case_idx) + "_" + id;
     if (FILE * f = fopen(mine.c_str(), "w")) fclose(f);
@@ -138,6 +149,7 @@ static result compare_interval(const std::vector<float> & y, const std::vector<u
     result r = { 0.0, 0.0, 0.0, 0 };
     std::vector<int32_t> qa(s.k), qb(s.k);   // the two candidate integers (equal when unambiguous)
     int64_t amb = 0;
+    bool injected = false;
     for (int64_t row = 0; row < s.n_act; row++) {
         const float * xr = x.data() + row * s.k;
         float m = 0.0f;
@@ -178,8 +190,9 @@ static result compare_interval(const std::vector<float> & y, const std::vector<u
                 mag += std::max(std::fabs(c0), std::fabs(c1));
                 dsum += d;
             }
-            const double ylo = (double) sa * (lo + 128.0 * dsum), yhi = (double) sa * (hi + 128.0 * dsum);
+            double ylo = (double) sa * (lo + 128.0 * dsum), yhi = (double) sa * (hi + 128.0 * dsum);
             const double slack = tol * (double) sa * (mag + 128.0 * std::fabs(dsum)) + 1e-30;
+            if (g_inject_ref && !injected) { ylo = NAN; injected = true; }
             const double yd = y[(size_t) row * s.m_out + c];
             // Codex q34: every comparison with NaN is false, so a NaN output would otherwise count as inside
             if (!std::isfinite(yd) || !std::isfinite(ylo) || !std::isfinite(yhi) || !std::isfinite(slack)) {
@@ -198,13 +211,16 @@ static result compare_interval(const std::vector<float> & y, const std::vector<u
 
 // Deterministic bound for the HVX path (Q8_0 activations: per 32-block scale max|x_b| / 127). Whatever the
 // rounding of the activation, each element is off by at most one step, so
-//   |y - exact| <= sum_b (max|x_b| / 127) * sum_j |w_j d_b|   +  1e-3 * sum |x_j w_j d_b|  (fp16 scales, sums)
-// where exact = sum x_j w_j d_b in double. max_abs reports the worst |y - exact| / bound (<= 1 passes).
+//   |y - exact| <= sum_b (max|x_b| / 127) * sum_j |w_j d_b|   +  1e-3 * sum |x_j w_j d_b|
+// where exact = sum x_j w_j d_b in double. The 1e-3 term covers the fp16 activation scale (relative rounding
+// 2^-11) and float summation; it is a chosen allowance, not a derived bound (Codex q36). max_abs reports the worst
+// |y - exact| / bound (<= 1 passes). Every quantity entering the verdict must be finite (Codex q36).
 static result compare_q8bound(const std::vector<float> & y, const std::vector<uint8_t> & wq, const std::vector<float> & x,
                               const shape & s) {
     const int64_t B = s.k / 32;
     const size_t bsz = ggml_row_size(GGML_TYPE_Q4_0, 32);
     result r = { 0.0, 0.0, 0.0, 0 };
+    bool injected = false;
     for (int64_t row = 0; row < s.n_act; row++) {
         const float * xr = x.data() + row * s.k;
         for (int64_t c = 0; c < s.m_out; c++) {
@@ -226,14 +242,90 @@ static result compare_q8bound(const std::vector<float> & y, const std::vector<ui
                 }
             }
             bound += 1e-3 * mag + 1e-9;
+            if (g_inject_bound && !injected) { bound = NAN; injected = true; }
+            if (g_inject_ref && !injected)   { exact = NAN; injected = true; }
             const double yd = y[(size_t) row * s.m_out + c];
-            if (!std::isfinite(yd)) { r.over++; r.max_abs = INFINITY; continue; }
             const double ratio = std::fabs(yd - exact) / bound;
+            if (!std::isfinite(yd) || !std::isfinite(exact) || !std::isfinite(bound) || !(bound > 0.0) || !std::isfinite(ratio)) {
+                r.over++;
+                r.max_abs = INFINITY;
+                continue;
+            }
             if (ratio > 1.0) r.over++;
             r.max_abs = std::max(r.max_abs, ratio);
         }
     }
     return r;
+}
+
+// Codex q36: padded-row layouts end to end. Weights of physical row length kv (2080) viewed as k = 2048, and the
+// activation likewise, in CPU buffers; computed through a scheduler with the HTP backend first and the CPU second,
+// and on the CPU alone. The node must be placed on the CPU (the HTP backend refuses the layout), the computation
+// must succeed, and both results must be identical. A contiguous control (kv == k) reports where it was placed.
+static int run_fallback(ggml_backend_t htp, std::mt19937 & gen) {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!cpu) { printf("[fallback] no CPU backend | MISMATCH\n"); return 1; }
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    const int64_t m = 64, k = 2048;
+    int bad = 0;
+    for (int64_t kv : { (int64_t) 2080, (int64_t) 2048 }) {
+        for (int64_t n : { (int64_t) 32, (int64_t) 64, (int64_t) 256 }) {
+            std::vector<float> wf((size_t) (m * kv)), x((size_t) (n * kv));
+            for (auto & v : wf) v = u(gen);
+            for (auto & v : x) v = u(gen);
+            std::vector<uint8_t> wq(ggml_row_size(GGML_TYPE_Q4_0, kv) * m);
+            ggml_quantize_chunk(GGML_TYPE_Q4_0, wf.data(), wq.data(), 0, m, kv, nullptr);
+
+            std::vector<float> y[2];
+            ggml_status st[2] = { GGML_STATUS_FAILED, GGML_STATUS_FAILED };
+            std::string placed = "?";
+            for (int run = 0; run < 2; run++) {   // 0: scheduler HTP + CPU, 1: CPU only
+                ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+                ggml_context * ctx = ggml_init(ip);
+                ggml_tensor * A = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, kv, m);
+                ggml_tensor * Bt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv, n);
+                ggml_tensor * a = kv == k ? A  : ggml_view_2d(ctx, A,  k, m, A->nb[1],  0);
+                ggml_tensor * b = kv == k ? Bt : ggml_view_2d(ctx, Bt, k, n, Bt->nb[1], 0);
+                ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+                ggml_cgraph * gf = ggml_new_graph(ctx);
+                ggml_build_forward_expand(gf, out);
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+                ggml_backend_tensor_set(A, wq.data(), 0, wq.size());
+                ggml_backend_tensor_set(Bt, x.data(), 0, x.size() * sizeof(float));
+                if (run == 0) {
+                    ggml_backend_t backs[2] = { htp, cpu };
+                    ggml_backend_sched_t sched = ggml_backend_sched_new(backs, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+                    if (ggml_backend_sched_alloc_graph(sched, gf)) {
+                        st[run] = ggml_backend_sched_graph_compute(sched, gf);
+                        ggml_backend_t pb = ggml_backend_sched_get_tensor_backend(sched, out);
+                        placed = pb ? ggml_backend_name(pb) : "none";
+                    }
+                    ggml_backend_sched_free(sched);
+                } else {
+                    st[run] = ggml_backend_graph_compute(cpu, gf);
+                }
+                y[run].resize((size_t) (m * n));
+                ggml_backend_tensor_get(out, y[run].data(), 0, y[run].size() * sizeof(float));
+                ggml_backend_buffer_free(buf);
+                ggml_free(ctx);
+            }
+            double max_abs = 0.0;
+            bool finite = true;
+            for (size_t i = 0; i < y[0].size(); i++) {
+                if (!std::isfinite(y[0][i]) || !std::isfinite(y[1][i])) finite = false;
+                max_abs = std::max(max_abs, (double) std::fabs(y[0][i] - y[1][i]));
+            }
+            const bool on_cpu = placed == ggml_backend_name(cpu);
+            const bool ok = kv == k ? (st[0] == GGML_STATUS_SUCCESS && finite)      // control: placement reported only
+                                    : (st[0] == GGML_STATUS_SUCCESS && st[1] == GGML_STATUS_SUCCESS && on_cpu && finite && max_abs == 0.0);
+            bad += ok ? 0 : 1;
+            printf("[fallback] m %lld n %lld k %lld rows %lld (%s) | placed on %s | status %d/%d | max |sched - cpu| %.3g | %s\n",
+                   (long long) m, (long long) n, (long long) k, (long long) kv, kv == k ? "contiguous control" : "padded",
+                   placed.c_str(), (int) st[0], (int) st[1], max_abs, ok ? "OK" : "MISMATCH");
+        }
+    }
+    ggml_backend_free(cpu);
+    return bad;
 }
 
 int main(int argc, char ** argv) {
@@ -255,6 +347,9 @@ int main(int argc, char ** argv) {
     const char * id          = getenv("ORACLE_ID") ? getenv("ORACLE_ID") : "a";
     const int    peers       = getenv("ORACLE_PEERS") ? atoi(getenv("ORACLE_PEERS")) : 1;
     const char * inject      = getenv("ORACLE_INJECT");
+    const bool   inject_out  = inject && (!strcmp(inject, "nan") || !strcmp(inject, "inf") || !strcmp(inject, "ninf"));
+    g_inject_bound = inject && !strcmp(inject, "bound");
+    g_inject_ref   = inject && !strcmp(inject, "ref");
     // different inputs per instance, so a result that leaked from another session cannot pass
     std::mt19937 gen(42 + (unsigned) id[0]);
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
@@ -291,7 +386,7 @@ int main(int argc, char ** argv) {
         const ggml_status st = ggml_backend_graph_compute(backend, gf);
         std::vector<float> y((size_t) (s.m_out * s.n_act));
         ggml_backend_tensor_get(out, y.data(), 0, y.size() * sizeof(float));
-        if (inject) {
+        if (inject_out) {
             // self-test of the verdicts (Codex q34): a non-finite output must fail every check
             y[y.size() / 2] = !strcmp(inject, "inf") ? INFINITY : !strcmp(inject, "ninf") ? -INFINITY : NAN;
         }
@@ -323,6 +418,10 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_free(buf_w);
         ggml_free(ctx);
         ggml_free(ctx_w);
+    }
+    // the fallback section is skipped in concurrent and injection runs (its own verdict does not use them)
+    if (!barrier_dir && !inject) {
+        bad += run_fallback(backend, gen);
     }
     ggml_backend_free(backend);
     printf("%s: %d case(s) mismatched\n", bad ? "FAIL" : "PASS", bad);
