@@ -142,13 +142,21 @@ int main(int argc, char ** argv) {
         std::vector<uint8_t> wq(ggml_row_size(GGML_TYPE_Q4_0, s.k) * s.m_out);
         ggml_quantize_chunk(GGML_TYPE_Q4_0, wf.data(), wq.data(), 0, s.m_out, s.k, nullptr);
 
+        // The weights get their own buffer marked as weights, as test-backend-ops and llama do: the Hexagon
+        // backend repacks Q4_0 into its tile layout only for tensors in such a buffer. (The first version put
+        // everything in one unmarked buffer; both the integer and the HVX path then read un-repacked blocks
+        // and every case "mismatched" by 1e7.)
+        ggml_init_params ipw = { ggml_tensor_overhead() * 2, nullptr, true };
+        ggml_context * ctx_w = ggml_init(ipw);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q4_0, s.k, s.m_out);
         ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(ip);
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, s.k, s.m_out);
         ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, s.k, s.n_act);
         ggml_tensor * out = ggml_mul_mat(ctx, a, b);
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
+        ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+        ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
         ggml_backend_tensor_set(a, wq.data(), 0, wq.size());
         ggml_backend_tensor_set(b, x.data(), 0, x.size() * sizeof(float));
@@ -168,7 +176,9 @@ int main(int argc, char ** argv) {
                rn.max_abs, rn.max_rel_row, (long long) rn.over, tr.max_abs, tr.max_rel_row, (long long) tr.over,
                rn.nmse_exact, ok ? "OK" : "MISMATCH");
         ggml_backend_buffer_free(buf);
+        ggml_backend_buffer_free(buf_w);
         ggml_free(ctx);
+        ggml_free(ctx_w);
     }
     ggml_backend_free(backend);
     printf("%s: %d case(s) mismatched\n", bad ? "FAIL" : "PASS", bad);
