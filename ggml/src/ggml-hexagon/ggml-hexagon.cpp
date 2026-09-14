@@ -2772,7 +2772,9 @@ void ggml_hexagon_session::flush_pending(bool all) {
         const uint32_t timeo = opt_oppoll ? 0 : 100000;
 
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
-        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+        // AEE_EINTERRUPTED (46): a bounded wait cut short by a signal - seen under two-session load on the device
+        // (2026-09-14), where it aborted a normal run. It is a retry like a timeout.
+        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK || err == AEE_EINTERRUPTED) {
             // Codex q33a: the host is the last supervisor (a job stuck on the DSP's calling thread, or a
             // response that never comes, is invisible to the DSP's own deadlines). Measured from the
             // oldest unanswered batch's submission; retries do not extend it. Nothing of this session may
@@ -2817,10 +2819,11 @@ void ggml_hexagon_session::flush_pending(bool all) {
                 static uint64_t lat_n = 0;
                 static uint32_t pend_max = 0;
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - batch_t.front()).count();
+                const bool new_max = ms > lat_max_ms * 1.1 + 1.0;
                 lat_max_ms = std::max(lat_max_ms, ms);
                 lat_sum_ms += ms;
                 pend_max = std::max(pend_max, (uint32_t) batch_t.size());
-                if (++lat_n % 200 == 0) {
+                if (++lat_n % 200 == 0 || new_max) {
                     GGML_LOG_INFO("ggml-hex: %s batch stats: n %llu max %.1f ms mean %.2f ms max-pending %u\n", this->c_name(),
                                   (unsigned long long) lat_n, lat_max_ms, lat_sum_ms / (double) lat_n, pend_max);
                 }
@@ -2865,7 +2868,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         if (fi_write_stall) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        if (err != AEE_EEXPIRED && err != AEE_EWOULDBLOCK) {
+        if (err != AEE_EEXPIRED && err != AEE_EWOULDBLOCK && err != AEE_EINTERRUPTED) {
             break;
         }
         // Codex q36: whichever expires first - this batch's submission or the oldest batch still unanswered
