@@ -394,6 +394,8 @@ struct htp_hmx_selftest {
 // fp16 HMX settled by experiment (Codex q23 design): integer -> fp16 cases -> integer, full counts.
 #define FP16_PRINT(...) FARF(ALWAYS, __VA_ARGS__)
 #include "hmxfp16.h"
+// fp16 HMX round 2: the MAC and output forms Qualcomm's own v73 fp16 kernels use (no :deep).
+#include "hmxfp16v2.h"
 
 // Which VTCM partitions exist, and how big? application_id selects the partition;
 // only id 0 had been queried before (8 MB).
@@ -470,6 +472,7 @@ static void htp_hmx_selftest_fn(void * data) {
     hmxcomb_run(a->vtcm + (6u << 20));
     hmxscl_run(a->vtcm + (6u << 20) + (512u << 10));
     hmxfp16_run(a->vtcm + (7u << 20));
+    hmxfp16v2_run(a->vtcm + (7u << 20) + (512u << 10));
 #endif
 }
 
