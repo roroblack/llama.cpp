@@ -100,7 +100,8 @@ static int    opt_mm_chunk  = 2; // 0 = refuse a MUL_MAT whose activation block 
                                  //     Measured pp512 on SM8735 at ubatch 256:
                                  //     mode 1 18.68 +/- 0.63 t/s, mode 2 31.42 +/- 1.01.
                                  //     MUL_MAT stays 556/556 either way.
-static int    opt_mm_int_hmx = 0;      // 1 = use the integer HMX Q4_0 matmul where the DSP verified it
+static int    opt_mm_int_hmx = 1;      // integer HMX Q4_0 matmul where the DSP's integer self test passed (default on,
+                                        // Codex q34/q36; verified on SM8735 only); GGML_HEXAGON_INT_HMX=0 turns it off
                                        // (parts whose fp16 HMX does not compute, e.g. SM8735 / v73)
 static int    opt_mm_int_minrows = 32; // integer HMX only for MUL_MATs with at least this many rows
 static int    opt_mm_int_nc = 0;       // integer HMX consumer threads (0 = all HVX threads)
@@ -3430,7 +3431,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             this->int_hmx = int_ok && opt_nhmx != 0 && hw_has_hmx;
             if (int_ok) {
                 GGML_LOG_INFO("ggml-hex: %s integer HMX self test passed; integer Q4_0 matmul %s\n", this->c_name(),
-                              opt_mm_int_hmx ? "on (GGML_HEXAGON_INT_HMX=1)" : "off (set GGML_HEXAGON_INT_HMX=1)");
+                              opt_mm_int_hmx ? "on by default (GGML_HEXAGON_INT_HMX=0 turns it off)"
+                                             : "off (GGML_HEXAGON_INT_HMX=0)");
             }
             if (this->n_hmx && !fp16_ok) {
                 GGML_LOG_WARN("ggml-hex: %s HMX self test computed the wrong answer; using HVX\n",
