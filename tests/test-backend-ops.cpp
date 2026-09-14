@@ -9920,6 +9920,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : {32, 33, 256}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 262144, n, 1536, {1, 1}, {1, 1}));
         }
+        // Planner transition points (hmxi_plan_seg with 8 MB VTCM, 4 consumers):
+        // rows per chunk drop 256 -> 224 between k 13248 and 13280 (k 13248 x 256 rows leaves 9,344 bytes);
+        // one column group holds 1024 / 512 / 160 / 64 outputs at k 2048 / 6144 / 10240 / 12288;
+        // the K-split weight conversion runs while a group has fewer column tiles than consumers (<= 96 outputs).
+        for (int64_t k : {13248, 13280}) {
+            for (int64_t n : {224, 256, 257}) {
+                for (int64_t m : {32, 33, 64}) {
+                    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
+            }
+        }
+        const int64_t group_edges[][2] = { {2048, 1024}, {6144, 512}, {10240, 160}, {12288, 64} };
+        for (const auto & e : group_edges) {
+            for (int64_t d : {0, 1, 32}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, e[1] + d, 256, e[0], {1, 1}, {1, 1}));
+            }
+        }
+        for (int64_t m : {96, 97, 128, 129}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, 256, 2048, {1, 1}, {1, 1}));
+        }
+        // the real largest shapes of gemma-4-E4B (FFN down K 10240, widest projection 10752 outputs)
+        for (int64_t n : {256, 257}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2560, n, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 10752, n, 2560, {1, 1}, {1, 1}));
+        }
     }
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));
