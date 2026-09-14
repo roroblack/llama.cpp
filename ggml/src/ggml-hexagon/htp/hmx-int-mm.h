@@ -105,8 +105,7 @@ static void hmxi_mid_from_dv(const HVX_Vector * dv, int B, HVX_Vector * mid) {
 
 static void hmxi_job_produce(void * data) {
     struct hmxi_job * j = (struct hmxi_job *) data;
-    // fault injection "lock": take the not-held branch; the real lock and hmx_locked are left untouched
-    if (!j->hq->hmx_locked || j->fi_lock) { atomic_store(&j->why, HMXI_WHY_LOCK); atomic_store(&j->abort, 1); return; }
+    if (!j->hq->hmx_locked) { atomic_store(&j->why, HMXI_WHY_LOCK); atomic_store(&j->abort, 1); return; }
     const int B = j->L.B, nc = j->L.nc, nseg = j->L.nseg, seg = j->L.seg;
     const int U = j->nct * j->n_rt;
     for (int u = 0; u < U; u++) {
@@ -224,8 +223,13 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
             for (int w = 0; w < HMXI_MAXW; w++) { atomic_store(&J.ready[w].v, 0); atomic_store(&J.freed[w].v, 0); }
             atomic_store(&J.abort, 0);
             atomic_store(&J.why, 0);
-            J.fi_lock   = hmxi_fi_take(ctx, fi, HMXI_FI_LOCK, "lock");
             J.fi_cancel = hmxi_fi_take(ctx, fi, HMXI_FI_CANCEL, "cancel");
+            if (hmxi_fi_take(ctx, fi, HMXI_FI_LOCK, "lock")) {
+                // a real lock failure (Codex q32): the queue thread releases the lock (SUSPEND), and its
+                // next lock attempt - for this producer - returns an error without taking it
+                hmx_queue_suspend(ctx->hmx_queue);
+                ctx->hmx_queue->fi_lock_fail = 1;
+            }
             t0 = HAP_perf_get_pcycles();
             if (!hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmxi_job_produce, &J))) return -4;
             // If the consumers cannot be started the producer would fill the rings and spin: raise

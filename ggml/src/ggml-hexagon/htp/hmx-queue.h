@@ -52,6 +52,7 @@ struct hmx_queue_s {
     void *           stack;
     uint32_t         hap_rctx;
     bool             hmx_locked;
+    volatile int     fi_lock_fail; // fault injection (test only): the next lock attempt fails, one shot
     struct htp_thread_trace * trace;
     bool             external_mem; // memory owned externally
 };

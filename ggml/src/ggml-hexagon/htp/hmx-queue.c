@@ -19,7 +19,14 @@ static inline void hmx_lock(hmx_queue_t q)
     if (!q->hmx_locked) {
         // Record the lock only when HAP granted it: callers check hmx_locked before issuing
         // HMX, and HMX without the lock takes a precise exception.
-        const int rc = HAP_compute_res_hmx_lock(q->hap_rctx);
+        int rc;
+        if (q->fi_lock_fail) {
+            // fault injection (GGML_HEXAGON_INT_HMX_FI=lock): this attempt fails and the lock is not taken
+            q->fi_lock_fail = 0;
+            rc = -1;
+        } else {
+            rc = HAP_compute_res_hmx_lock(q->hap_rctx);
+        }
         if (rc == 0) {
             q->hmx_locked = true;
         } else {
