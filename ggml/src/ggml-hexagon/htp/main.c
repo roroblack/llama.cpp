@@ -1310,6 +1310,15 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         }
     }
 
+    // Codex q33a/q34: a session that hit a deadline stays poisoned; later batches are refused before the
+    // cache clean and prep_op_bufs() (which may unmap or remap buffers), before any tensor preparation and
+    // before VTCM or queue use, and are answered with the poison status.
+    const int poison = atomic_load(&ctx->poisoned);
+    int op_status = HTP_STATUS_OK;
+    if (poison) {
+        op_status = poison;
+        FARF(ERROR, "batch refused: session poisoned (status %d)", poison);
+    } else {
     // Clean cache at the start of the batch
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
@@ -1321,14 +1330,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     prep_op_bufs(ctx, bufs, n_bufs);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
 
-    // Codex q33a: a session that hit a deadline stays poisoned; later batches are refused before any
-    // tensor preparation or VTCM/queue use, and answered with the poison status.
-    const int poison = atomic_load(&ctx->poisoned);
-    int op_status = HTP_STATUS_OK;
-    if (poison) {
-        op_status = poison;
-        FARF(ERROR, "batch refused: session poisoned (status %d)", poison);
-    } else {
     prep_tensors(ctx, bufs, tens, n_tens);
 
     struct htp_ops_context *octx = &ctx->octx;
@@ -1369,10 +1370,16 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     work_queue_suspend(ctx->work_queue);
     }  // !poison
 
+    // Codex q34: after status 7 the workers are not confirmed stopped and may still write; nothing of this
+    // session's memory is flushed, and the answer below carries no buffer.
+    const bool dead = atomic_load(&ctx->poisoned) == HTP_STATUS_SESSION_POISONED;
+
     // Flush remaining dirty tensors at the end of the batch
-    htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
-    qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
-    htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
+    if (!dead) {
+        htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
+        qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+        htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
+    }
 
     profile_stop(HTP_PROF_BASIC, &batch_prof);
 
@@ -1399,6 +1406,15 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         // only the host's batch deadline can end it
         ctx->fi_skip_rsp = 0;
         FARF(ALWAYS, "FI: response for batch %u suppressed", (unsigned) req->id);
+        return;
+    }
+
+    if (dead) {
+        // control-only answer (Codex q34): no buffer is flushed or handed back; the host aborts on the status
+        err = dspqueue_write(queue, 0, 0, NULL, sizeof(rsp), (const uint8_t *) &rsp, DSPQUEUE_TIMEOUT_NONE);
+        if (err != 0) {
+            FARF(ERROR, "dspqueue_write (poisoned, control-only) failed: 0x%08x", (unsigned) err);
+        }
         return;
     }
 

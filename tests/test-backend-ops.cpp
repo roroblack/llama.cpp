@@ -4831,6 +4831,40 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Q4_0 x F32 MUL_MAT whose src1 is a contiguous view at a nonzero offset (rows skip.. of a larger activation).
+// Codex q34: such a view passes the integer-HMX selector's contiguity check, so it must be computed correctly.
+struct test_mul_mat_offset_view : public test_case {
+    const int64_t m, n, k, skip;
+
+    std::string vars() override {
+        return VARS_TO_STR4(m, n, k, skip);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_offset_view(int64_t m = 64, int64_t n = 64, int64_t k = 2048, int64_t skip = 8)
+        : m(m), n(n), k(k), skip(skip) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * big = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n + skip);
+        ggml_set_name(big, "b_big");
+        ggml_tensor * b = ggml_view_2d(ctx, big, k, n, big->nb[1], skip * big->nb[1]);
+        ggml_set_name(b, "b_view");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
 #define P 1.0f
 #define N -1.0f
 
@@ -9969,13 +10003,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     // m = n = 1 has a single output, so its NMSE is that one value's squared relative error and
                     // fails whenever the random dot product lands near zero: measured on the device (HVX path,
                     // 30 runs each) 2-6/30 failures for k = 2016..12288, 0/30 for m = 32 or n = 32 at k = 2080.
-                    // One activation row never reaches the integer path, so nothing integer-specific is lost.
+                    // One activation row never reaches the integer path. The shape is kept, with a deterministic
+                    // Q8_0 error bound, in tests/test-hmx-int-oracle.cpp (Codex q34).
                     if (m == 1 && n == 1) {
                         continue;
                     }
                     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
                 }
             }
+        }
+        // Codex q34 layouts: padded rows (k_v > k: a and b are non-contiguous views), permuted batched src0/src1,
+        // and a contiguous src1 view at a nonzero offset. The selector must refuse the first two (they take the
+        // other paths) and compute the third correctly; all three are compared with INT_HMX on and off.
+        for (int64_t n : {32, 64, 256}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, n, 2048, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2080));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, n, 2048, {2, 1}, {1, 1}, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_mul_mat_offset_view(64, n, 2048, 8));
         }
         for (int64_t n : {32, 33, 256}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 262144, n, 1536, {1, 1}, {1, 1}));

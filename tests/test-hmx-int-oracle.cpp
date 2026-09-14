@@ -6,11 +6,17 @@
 //   y = s_a * ( sum_b 256 d_b QT_b  +  128 sum_b d_b )           (d_b = the block's fp16 scale)
 // Rounding happens only in the integers; floats enter in the final sums. So the device output should
 // match this reconstruction to float-summation accuracy - far tighter than test-backend-ops' 5e-4 NMSE
-// against the CPU's Q4_0 x Q8_0 matmul. The float->int conversion rule of the DSP is not documented
-// here, so the reconstruction is done twice (round-to-nearest and truncation) and both are reported.
+// against the CPU's Q4_0 x Q8_0 matmul. The verdict is the interval check in compare_interval(); the
+// round-to-nearest and truncation point reconstructions are printed as diagnostics only.
+//
+// Shapes below the integer path's row minimum (one activation row) run on the HVX path, which quantizes the
+// activations to Q8_0. Their single output is checked against a deterministic error bound instead of an NMSE
+// (Codex q34: a one-value NMSE fails whenever the dot product lands near zero).
 //
 // usage: test-hmx-int-oracle [device, default HTP0]   (set GGML_HEXAGON_INT_HMX=1 to use the integer path)
-// Exit code 0 when, for every case, one rounding hypothesis matches within the tolerance.
+//   ORACLE_BARRIER_DIR / ORACLE_ID / ORACLE_PEERS   start barrier for concurrent sessions (timeout = failure)
+//   ORACLE_INJECT=nan|inf|ninf                      corrupt one output of every case; every case must then fail
+// Exit code 0 when every case passes.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -31,8 +37,9 @@
 
 // Optional start barrier for concurrent-session runs (Codex q32 item 2): with ORACLE_BARRIER_DIR, ORACLE_ID
 // and ORACLE_PEERS set, every instance drops "<case>_<id>" into the directory right before computing a case
-// and waits (up to 60 s) until all peers have done the same, so the sessions really execute together.
-static void barrier_wait(const char * dir, const char * id, int case_idx, int peers) {
+// and waits (up to 60 s) until all peers have done the same. It aligns the submissions; it does not prove the
+// DSP executions overlapped. A timeout is returned as false and fails the case (Codex q34).
+static bool barrier_wait(const char * dir, const char * id, int case_idx, int peers) {
     const std::string mine = std::string(dir) + "/" + std::to_string(case_idx) + "_" + id;
     if (FILE * f = fopen(mine.c_str(), "w")) fclose(f);
     const std::string prefix = std::to_string(case_idx) + "_";
@@ -45,16 +52,17 @@ static void barrier_wait(const char * dir, const char * id, int case_idx, int pe
             }
             closedir(d);
         }
-        if (n >= peers) return;
+        if (n >= peers) return true;
         if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) {
             fprintf(stderr, "barrier: case %d waited 60 s for %d peers (saw %d)\n", case_idx, peers, n);
-            return;
+            return false;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 }
 
-struct shape { int64_t m_out, n_act, k; };
+// hvx = 1: one activation row, below the integer path's row minimum -> HVX path, Q8_0 bound check
+struct shape { int64_t m_out, n_act, k; int hvx; };
 
 static float fp16_to_f32(uint16_t h) { return ggml_fp16_to_fp32(h); }
 
@@ -114,12 +122,15 @@ static result compare(const std::vector<float> & y, const std::vector<uint8_t> &
     return r;
 }
 
-// Exact check of the integer semantics. Measured on the device (2026-09-14): the DSP truncates x * (32767 /
+// Interval check of the integer semantics. Measured on the device (2026-09-14): the DSP truncates x * (32767 /
 // max|x|) toward zero (the truncation hypothesis fits ~5x better than nearest), but it forms that product in
 // qf32, which can land on the other side of an integer when the exact product is within a few ulp of it.
 // For such elements both integers are allowed; each block sum S_b - and QT_b = floor(S_b / 256) - then has a
 // small range, and y an interval. The device must land inside it, plus float-summation slack (tol relative to
 // the magnitude of the terms). Anything else - a wrong tile, block, segment, scale or row - lands far outside.
+// The 4e-7 ambiguity window is EMPIRICAL (Codex q34): it is not a proven bound on the qf32 product error, so
+// this is a tight interval oracle, not a proof. *n_amb counts ambiguous ACTIVATION elements (n_act * k), not
+// outputs.
 static result compare_interval(const std::vector<float> & y, const std::vector<uint8_t> & wq, const std::vector<float> & x,
                                const shape & s, double tol, int64_t * n_amb) {
     const int64_t B = s.k / 32;
@@ -170,12 +181,58 @@ static result compare_interval(const std::vector<float> & y, const std::vector<u
             const double ylo = (double) sa * (lo + 128.0 * dsum), yhi = (double) sa * (hi + 128.0 * dsum);
             const double slack = tol * (double) sa * (mag + 128.0 * std::fabs(dsum)) + 1e-30;
             const double yd = y[(size_t) row * s.m_out + c];
+            // Codex q34: every comparison with NaN is false, so a NaN output would otherwise count as inside
+            if (!std::isfinite(yd) || !std::isfinite(ylo) || !std::isfinite(yhi) || !std::isfinite(slack)) {
+                r.over++;
+                r.max_abs = INFINITY;
+                continue;
+            }
             const double out = yd < ylo - slack ? (ylo - slack) - yd : yd > yhi + slack ? yd - (yhi + slack) : 0.0;
             if (out > 0.0) r.over++;
             r.max_abs = std::max(r.max_abs, out);
         }
     }
     *n_amb = amb;
+    return r;
+}
+
+// Deterministic bound for the HVX path (Q8_0 activations: per 32-block scale max|x_b| / 127). Whatever the
+// rounding of the activation, each element is off by at most one step, so
+//   |y - exact| <= sum_b (max|x_b| / 127) * sum_j |w_j d_b|   +  1e-3 * sum |x_j w_j d_b|  (fp16 scales, sums)
+// where exact = sum x_j w_j d_b in double. max_abs reports the worst |y - exact| / bound (<= 1 passes).
+static result compare_q8bound(const std::vector<float> & y, const std::vector<uint8_t> & wq, const std::vector<float> & x,
+                              const shape & s) {
+    const int64_t B = s.k / 32;
+    const size_t bsz = ggml_row_size(GGML_TYPE_Q4_0, 32);
+    result r = { 0.0, 0.0, 0.0, 0 };
+    for (int64_t row = 0; row < s.n_act; row++) {
+        const float * xr = x.data() + row * s.k;
+        for (int64_t c = 0; c < s.m_out; c++) {
+            const uint8_t * wrow = wq.data() + (size_t) c * B * bsz;
+            double exact = 0.0, bound = 0.0, mag = 0.0;
+            for (int64_t b = 0; b < B; b++) {
+                const uint8_t * blk = wrow + b * bsz;
+                uint16_t dh; memcpy(&dh, blk, 2);
+                const double d = fp16_to_f32(dh);
+                const uint8_t * qs = blk + 2;
+                double mb = 0.0;
+                for (int j = 0; j < 32; j++) mb = std::max(mb, (double) std::fabs(xr[b * 32 + j]));
+                for (int j = 0; j < 32; j++) {
+                    const int w = (j < 16 ? (qs[j] & 0x0f) : (qs[j - 16] >> 4)) - 8;
+                    const double t = (double) xr[b * 32 + j] * w * d;
+                    exact += t;
+                    mag   += std::fabs(t);
+                    bound += (mb / 127.0) * std::fabs(w * d);
+                }
+            }
+            bound += 1e-3 * mag + 1e-9;
+            const double yd = y[(size_t) row * s.m_out + c];
+            if (!std::isfinite(yd)) { r.over++; r.max_abs = INFINITY; continue; }
+            const double ratio = std::fabs(yd - exact) / bound;
+            if (ratio > 1.0) r.over++;
+            r.max_abs = std::max(r.max_abs, ratio);
+        }
+    }
     return r;
 }
 
@@ -188,13 +245,16 @@ int main(int argc, char ** argv) {
     if (!backend) { fprintf(stderr, "cannot init %s\n", dev_name); return 2; }
 
     const shape shapes[] = {
-        {  32,  32,   32 }, { 1536,  33, 1536 }, {  64, 256, 2048 }, {  96, 257, 12288 },
-        { 1024, 256, 2048 }, { 1025, 256, 2048 }, { 2560, 256, 10240 }, {  33, 255, 2080 },
+        {  32,  32,   32, 0 }, { 1536,  33, 1536, 0 }, {  64, 256, 2048, 0 }, {  96, 257, 12288, 0 },
+        { 1024, 256, 2048, 0 }, { 1025, 256, 2048, 0 }, { 2560, 256, 10240, 0 }, {  33, 255, 2080, 0 },
+        // single-output shapes (HVX path), kept with a deterministic bound instead of test-backend-ops' NMSE
+        {    1,   1, 2016, 1 }, {    1,   1, 2080, 1 }, {    1,   1, 12288, 1 },
     };
     const double tol = 1e-5;   // relative to |y| + one block quantum (s_a * 256 * |sum d|)
     const char * barrier_dir = getenv("ORACLE_BARRIER_DIR");
     const char * id          = getenv("ORACLE_ID") ? getenv("ORACLE_ID") : "a";
     const int    peers       = getenv("ORACLE_PEERS") ? atoi(getenv("ORACLE_PEERS")) : 1;
+    const char * inject      = getenv("ORACLE_INJECT");
     // different inputs per instance, so a result that leaked from another session cannot pass
     std::mt19937 gen(42 + (unsigned) id[0]);
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
@@ -225,25 +285,40 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
         ggml_backend_tensor_set(a, wq.data(), 0, wq.size());
         ggml_backend_tensor_set(b, x.data(), 0, x.size() * sizeof(float));
-        if (barrier_dir && peers > 1) barrier_wait(barrier_dir, id, case_idx, peers);
+        bool barrier_ok = true;
+        if (barrier_dir && peers > 1) barrier_ok = barrier_wait(barrier_dir, id, case_idx, peers);
         case_idx++;
         const ggml_status st = ggml_backend_graph_compute(backend, gf);
         std::vector<float> y((size_t) (s.m_out * s.n_act));
         ggml_backend_tensor_get(out, y.data(), 0, y.size() * sizeof(float));
+        if (inject) {
+            // self-test of the verdicts (Codex q34): a non-finite output must fail every check
+            y[y.size() / 2] = !strcmp(inject, "inf") ? INFINITY : !strcmp(inject, "ninf") ? -INFINITY : NAN;
+        }
 
-        const result rn = compare(y, wq, x, s, true, tol);
-        const result tr = compare(y, wq, x, s, false, tol);
-        int64_t amb = 0;
-        const result iv = compare_interval(y, wq, x, s, tol, &amb);
-        // the verdict is the exact interval check; the two point hypotheses are kept as diagnostics
-        const bool ok = st == GGML_STATUS_SUCCESS && iv.over == 0;
+        bool ok;
+        if (s.hvx) {
+            const result qb = compare_q8bound(y, wq, x, s);
+            ok = st == GGML_STATUS_SUCCESS && qb.over == 0 && barrier_ok;
+            printf("[%s] m_out %5lld n_act %4lld k %5lld status %d | hvx q8 bound: over %lld, worst err/bound %.3g%s | %s\n",
+                   id, (long long) s.m_out, (long long) s.n_act, (long long) s.k, (int) st,
+                   (long long) qb.over, qb.max_abs, barrier_ok ? "" : " | barrier timeout", ok ? "OK" : "MISMATCH");
+        } else {
+            const result rn = compare(y, wq, x, s, true, tol);
+            const result tr = compare(y, wq, x, s, false, tol);
+            int64_t amb = 0;
+            const result iv = compare_interval(y, wq, x, s, tol, &amb);
+            // the verdict is the interval check; the two point hypotheses are kept as diagnostics
+            ok = st == GGML_STATUS_SUCCESS && iv.over == 0 && barrier_ok;
+            printf("[%s] m_out %5lld n_act %4lld k %5lld status %d | interval: outside %lld/%lld outputs (by up to %.3g), "
+                   "ambiguous activation elements %lld/%lld | nearest: max_abs %.3g over %lld | trunc: max_abs %.3g over %lld | "
+                   "NMSE vs exact %.3g%s | %s\n",
+                   id, (long long) s.m_out, (long long) s.n_act, (long long) s.k, (int) st,
+                   (long long) iv.over, (long long) (s.m_out * s.n_act), iv.max_abs, (long long) amb, (long long) (s.n_act * s.k),
+                   rn.max_abs, (long long) rn.over, tr.max_abs, (long long) tr.over,
+                   rn.nmse_exact, barrier_ok ? "" : " | barrier timeout", ok ? "OK" : "MISMATCH");
+        }
         bad += ok ? 0 : 1;
-        printf("[%s] m_out %5lld n_act %4lld k %5lld status %d | interval: outside %lld (by up to %.3g), ambiguous q %lld/%lld | "
-               "nearest: max_abs %.3g over %lld | trunc: max_abs %.3g over %lld | NMSE vs exact %.3g | %s\n",
-               id, (long long) s.m_out, (long long) s.n_act, (long long) s.k, (int) st,
-               (long long) iv.over, iv.max_abs, (long long) amb, (long long) (s.n_act * s.k),
-               rn.max_abs, (long long) rn.over, tr.max_abs, (long long) tr.over,
-               rn.nmse_exact, ok ? "OK" : "MISMATCH");
         ggml_backend_buffer_free(buf);
         ggml_backend_buffer_free(buf_w);
         ggml_free(ctx);

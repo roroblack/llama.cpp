@@ -2757,6 +2757,14 @@ void ggml_hexagon_session::flush_pending(bool all) {
         struct dspqueue_buffer dbuf;
         uint32_t               n_dbufs;
 
+        // Codex q34: the batch deadline is checked on every pass, also while answers keep arriving, not only
+        // when a read times out. Measured from the oldest unanswered batch's submission attempt.
+        if (!batch_t.empty() &&
+            std::chrono::steady_clock::now() - batch_t.front() > std::chrono::seconds(opt_batch_deadline_s)) {
+            GGML_ABORT("ggml-hex: %s: no answer to a DSP batch within %d s; ending the process\n",
+                       this->c_name(), opt_batch_deadline_s);
+        }
+
         // Read response packet from queue
         // Codex q33a: never block longer than 100 ms (DSPQUEUE_TIMEOUT may be "none"), so the batch deadline
         // below is checked even when the DSP never answers.
@@ -2780,6 +2788,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
         }
 
+        // Codex q33a/q34: a poisoned session answers control-only (no buffer) - handle it before the buffer
+        // sanity check. DSP workers could not be confirmed stopped; nothing of this session may be reused, not
+        // even by teardown. End the process.
+        if (rsp_size == sizeof(rsp) && rsp.status == HTP_STATUS_SESSION_POISONED) {
+            GGML_ABORT("ggml-hex: %s: DSP session poisoned with workers not confirmed stopped\n", this->c_name());
+        }
+
         // Basic sanity checks
         if (rsp_size != sizeof(rsp) || n_dbufs != 1) {
             GGML_ABORT("ggml-hex: %s dspcall : bad response : size %u dspbufs %u\n", this->c_name(), rsp_size, n_dbufs);
@@ -2789,11 +2804,6 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
             // Remember it: graph_compute reports GGML_STATUS_FAILED instead of silently succeeding.
             this->op_failed++;
-            if (rsp.status == HTP_STATUS_SESSION_POISONED) {
-                // Codex q33a: DSP workers could not be confirmed stopped; nothing of this session may be
-                // reused, not even by teardown. End the process.
-                GGML_ABORT("ggml-hex: %s: DSP session poisoned with workers not confirmed stopped\n", this->c_name());
-            }
         }
 
         op_queue->pop(rsp, dbuf);
@@ -2808,6 +2818,10 @@ void ggml_hexagon_session::flush_pending(bool all) {
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (op_batch->n_ops < min_ops) { return; }
 
+    // Codex q34: the deadline starts at the submission attempt, so a full queue or a stuck write is covered
+    // as well as a missing answer
+    const auto t_submit = std::chrono::steady_clock::now();
+
     htp_opbatch_req req {};
     dspqueue_buffer dbuf{};
 
@@ -2821,11 +2835,29 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
-    int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
+    // bounded waits (DSPQUEUE_TIMEOUT may be "none"): retry in 100 ms steps until the batch deadline
+    // test only: GGML_HEXAGON_FI_WRITE_STALL=1 makes every write attempt time out, to exercise the
+    // submission deadline below (Codex q34: queue saturation / stuck write)
+    static const bool fi_write_stall = getenv("GGML_HEXAGON_FI_WRITE_STALL") != nullptr;
+    int err;
+    for (;;) {
+        err = fi_write_stall ? AEE_EEXPIRED
+                             : dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, 100000);
+        if (fi_write_stall) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (err != AEE_EEXPIRED && err != AEE_EWOULDBLOCK) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() - t_submit > std::chrono::seconds(opt_batch_deadline_s)) {
+            GGML_ABORT("ggml-hex: %s: could not submit a DSP batch within %d s; ending the process\n",
+                       this->c_name(), opt_batch_deadline_s);
+        }
+    }
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
-    batch_t.push_back(std::chrono::steady_clock::now());
+    batch_t.push_back(t_submit);
 }
 
 void ggml_hexagon_session::flush(bool all) {
@@ -4065,6 +4097,9 @@ static bool ggml_hexagon_precompute_int_hmx_mm_params(
     const int m = (int) src1->ne[1];
     if (k % 32 != 0 || m < opt_mm_int_minrows) return false;
     if (src0->nb[0] > src0->nb[1] || src1->nb[0] != sizeof(float) || src1->nb[0] > src1->nb[1]) return false;
+    // Codex q34: the stride checks above let a padded-row src1 (nb[1] > ne[0] * 4) through. The kernel is only
+    // validated on fully contiguous operands; views, padded rows and permutations take the other paths.
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     // consumers: all HVX threads unless GGML_HEXAGON_INT_HMX_NC caps them; host and DSP plan the VTCM
     // layout with this same number (the DSP takes min(kparams->n_threads, its thread count))
     int nc = (int) sess->n_threads;
