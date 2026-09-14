@@ -3391,7 +3391,9 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
         }
         ret = hmx_mm_q4int_2d_f32(octx->ctx, (float *) dst->data, (int) (dst->nb[1] / sizeof(float)), (int) dst->ne[0],
                                   (const float *) src1->data, act_stride, (const uint8_t *) src0->data,
-                                  m_total, k, n, n_threads, kparams->vtcm_size);
+                                  m_total, k, n, n_threads, kparams->vtcm_size,
+                                  0                   /* K segment: default (HMXI_SEG) */,
+                                  kparams->pipeline   /* integer path: fault injection HMXI_FI_*, 0 = off */);
     } else if (kparams->kernel_type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
         hmx_mm_f16_f32_batched_params_t batch_params = {
             .dst             = (float *) dst->data,

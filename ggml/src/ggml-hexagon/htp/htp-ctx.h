@@ -94,6 +94,7 @@ struct htp_context {
     // hwinfo's n_hmx (bit 0 stays the fp16 verdict).
     uint32_t               hmx_int_status;
     void *                 hmxi_job;          // integer-HMX matmul job state (hmx-int-mm.h), per context
+    uint32_t               hmxi_fi_fired;     // integer-HMX fault injection already fired in this session
     bool                   etm;
     uint32_t               profiler;
     struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];

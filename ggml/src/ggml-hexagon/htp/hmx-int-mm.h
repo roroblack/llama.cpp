@@ -45,7 +45,22 @@ struct hmxi_job {
     int                        dst_stride, dst_cols;
     struct hmxi_seq            ready[HMXI_MAXW], freed[HMXI_MAXW];
     atomic_int                 abort;
+    atomic_int                 why;      // HMXI_WHY_*: what raised abort
+    int                        fi_lock;  // fault injection armed for this group (producer side)
+    int                        fi_cancel;
 };
+
+#define HMXI_WHY_LOCK   1
+#define HMXI_WHY_CANCEL 2
+
+// Fault injection (Codex q31): fires at most once per DSP session, at the point it names, so a case
+// that never reaches that point reports no FI_HIT instead of a false pass.
+static int hmxi_fi_take(struct htp_context * ctx, int fi, int want, const char * stage) {
+    if (fi != want || ctx->hmxi_fi_fired) return 0;
+    ctx->hmxi_fi_fired = 1;
+    FARF(ALWAYS, "FI_HIT int-hmx stage %s", stage);
+    return 1;
+}
 
 static void hmxi_job_quant(unsigned int n, unsigned int i, void * data) {
     struct hmxi_job * j = (struct hmxi_job *) data;
@@ -90,13 +105,15 @@ static void hmxi_mid_from_dv(const HVX_Vector * dv, int B, HVX_Vector * mid) {
 
 static void hmxi_job_produce(void * data) {
     struct hmxi_job * j = (struct hmxi_job *) data;
-    if (!j->hq->hmx_locked) { atomic_store(&j->abort, 1); return; }
+    // fault injection "lock": take the not-held branch; the real lock and hmx_locked are left untouched
+    if (!j->hq->hmx_locked || j->fi_lock) { atomic_store(&j->why, HMXI_WHY_LOCK); atomic_store(&j->abort, 1); return; }
     const int B = j->L.B, nc = j->L.nc, nseg = j->L.nseg, seg = j->L.seg;
     const int U = j->nct * j->n_rt;
     for (int u = 0; u < U; u++) {
         const int w = u % nc, jw = u / nc, c = u / j->n_rt, rt = u % j->n_rt;
         for (int sg = 0; sg < nseg; sg++) {
             const int s = jw * nseg + sg, slot = s % HMXI_DEPTH;
+            if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;  // segment boundary
             while ((int) atomic_load_explicit(&j->freed[w].v, memory_order_acquire) + HMXI_DEPTH <= s) {
                 if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;
                 hex_pause();
@@ -105,6 +122,11 @@ static void hmxi_job_produce(void * data) {
             hmxi_blocks(j->at + ((size_t) rt * B + b0) * 2048, j->wt + ((size_t) c * B + b0) * 1024,
                         j->ring + ((size_t) w * HMXI_DEPTH + slot) * seg * 2048, j->rec, nb);
             atomic_store_explicit(&j->ready[w].v, (unsigned) (s + 1), memory_order_release);
+            if (j->fi_cancel) {  // fault injection "cancel": stop right after the first published segment
+                atomic_store(&j->why, HMXI_WHY_CANCEL);
+                atomic_store(&j->abort, 1);
+                return;
+            }
         }
     }
 }
@@ -123,12 +145,15 @@ static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
                 if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;
                 hex_pause();
             }
+            // an abort can arrive after this segment was already published: stop at the boundary
+            if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;
             const int b0 = sg * seg, nb = B - b0 < seg ? B - b0 : seg;
             const uint8_t * src = j->ring + ((size_t) w * HMXI_DEPTH + slot) * seg * 2048;
             hmxi_combine(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 0, nb, sg > 0);
             hmxi_combine(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 8, nb, sg > 0);
             atomic_store_explicit(&j->freed[w].v, (unsigned) (s + 1), memory_order_release);
         }
+        if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;  // no epilogue after an abort
         const int rows = j->mr - rt * 32 < 32 ? j->mr - rt * 32 : 32;
         const int col0 = (j->ct0 + c) * 32, cols = j->dst_cols - col0 < 32 ? j->dst_cols - col0 : 32;
         if (rows > 0 && cols > 0)
@@ -140,10 +165,11 @@ static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
 // W = host-repacked Q4_0 with n (padded to 32) output rows. Returns 0 on success.
 static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_stride, int dst_cols,
                                const float * act, int act_stride, const uint8_t * weight,
-                               int m, int k, int n, int n_threads, int vtcm_size) {
+                               int m, int k, int n, int n_threads, int vtcm_size, int seg_cap, int fi) {
     if (!ctx->hmx_queue || !ctx->work_queue) return -2;
     size_t V = (size_t) vtcm_size;
     if (V == 0 || V > ctx->vtcm_size) V = ctx->vtcm_size;
+    if (hmxi_fi_take(ctx, fi, HMXI_FI_VTCM_PLAN, "vtcm_plan")) V = 1;  // the planner must refuse a 1-byte budget
     int nc = n_threads;
     if (nc > (int) ctx->n_threads) nc = (int) ctx->n_threads;
     // One job per context: a function static would be shared by every session in the DSP process.
@@ -154,7 +180,13 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     struct hmxi_job * const Jp = (struct hmxi_job *) ctx->hmxi_job;
 #define J (*Jp)
     memset(&J, 0, sizeof(J));
-    if (!hmxi_plan(k, m, n, nc, V, &J.L)) return -3;
+    if (!hmxi_plan_seg(k, m, n, nc, V, seg_cap, &J.L)) return -3;
+    // the layout must fit what we may use; "vtcm_short" pretends one byte less than the plan needs
+    {
+        size_t usable = V;
+        if (hmxi_fi_take(ctx, fi, HMXI_FI_VTCM_SHORT, "vtcm_short")) usable = J.L.total - 1;
+        if (J.L.total > usable) return -3;
+    }
 
     uint8_t * vtcm = ctx->vtcm_base;
     J.hq   = ctx->hmx_queue;
@@ -176,25 +208,30 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     for (int m0 = 0; m0 < m; m0 += J.L.mc) {
         J.m0 = m0; J.mr = m - m0 < J.L.mc ? m - m0 : J.L.mc; J.n_rt = (J.mr + 31) / 32;
         t0 = HAP_perf_get_pcycles();
-        if (!work_queue_run(ctx->work_queue, hmxi_job_quant, &J, ctx->n_threads)) return -7;
+        // fault injection replaces a submission by the "not submitted" result without running it
+        if (hmxi_fi_take(ctx, fi, HMXI_FI_QUANT, "quant") || !work_queue_run(ctx->work_queue, hmxi_job_quant, &J, ctx->n_threads)) return -7;
         tA += HAP_perf_get_pcycles() - t0;
         for (int ct0 = 0; ct0 < n_ct_all; ct0 += J.L.nct) {
             J.ct0 = ct0; J.nct = n_ct_all - ct0 < J.L.nct ? n_ct_all - ct0 : J.L.nct;
             t0 = HAP_perf_get_pcycles();
             if (J.nct < (int) ctx->n_threads) {
-                if (!work_queue_run(ctx->work_queue, hmxi_job_cvt_k, &J, ctx->n_threads)) return -8;
+                if (hmxi_fi_take(ctx, fi, HMXI_FI_CVT_K, "cvt_k") || !work_queue_run(ctx->work_queue, hmxi_job_cvt_k, &J, ctx->n_threads)) return -8;
                 for (int c = 0; c < J.nct; c++) hmxi_mid_from_dv(J.dv + c * J.L.B, J.L.B, J.mid + c);
             } else {
-                if (!work_queue_run(ctx->work_queue, hmxi_job_cvt, &J, ctx->n_threads)) return -8;
+                if (hmxi_fi_take(ctx, fi, HMXI_FI_CVT, "cvt") || !work_queue_run(ctx->work_queue, hmxi_job_cvt, &J, ctx->n_threads)) return -8;
             }
             tW += HAP_perf_get_pcycles() - t0;
             for (int w = 0; w < HMXI_MAXW; w++) { atomic_store(&J.ready[w].v, 0); atomic_store(&J.freed[w].v, 0); }
             atomic_store(&J.abort, 0);
+            atomic_store(&J.why, 0);
+            J.fi_lock   = hmxi_fi_take(ctx, fi, HMXI_FI_LOCK, "lock");
+            J.fi_cancel = hmxi_fi_take(ctx, fi, HMXI_FI_CANCEL, "cancel");
             t0 = HAP_perf_get_pcycles();
             if (!hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmxi_job_produce, &J))) return -4;
             // If the consumers cannot be started the producer would fill the rings and spin: raise
             // abort so it returns, and still pop it before anything reuses this VTCM.
-            const bool consumed = work_queue_run(ctx->work_queue, hmxi_job_consume, &J, (unsigned) J.L.nc);
+            const bool consumed = hmxi_fi_take(ctx, fi, HMXI_FI_CONSUME, "consume") ? false
+                                : work_queue_run(ctx->work_queue, hmxi_job_consume, &J, (unsigned) J.L.nc);
             if (!consumed) atomic_store(&J.abort, 1);
             hmx_queue_pop(ctx->hmx_queue);
             if (!consumed) {
@@ -203,6 +240,10 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
             }
             tP += HAP_perf_get_pcycles() - t0;
             if (atomic_load(&J.abort)) {
+                if (atomic_load(&J.why) == HMXI_WHY_CANCEL) {
+                    FARF(ERROR, "int-hmx: cancelled; producer and consumers stopped at a segment boundary");
+                    return -10;
+                }
                 FARF(ERROR, "int-hmx: the HMX queue thread does not hold the HMX lock; not issuing HMX");
                 return -5;
             }

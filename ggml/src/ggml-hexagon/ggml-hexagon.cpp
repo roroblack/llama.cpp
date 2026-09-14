@@ -106,6 +106,7 @@ static int    opt_mm_int_minrows = 32; // integer HMX only for MUL_MATs with at 
 static int    opt_mm_int_nc = 0;       // integer HMX consumer threads (0 = all HVX threads)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_pvreg  = 0; // 1 = HVX flash-attn PV keeps the f32 accumulator in registers per K/V block
+static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -396,6 +397,7 @@ struct ggml_hexagon_session {
     bool             valid_iface;
 
     std::atomic<int>      op_pending;
+    std::atomic<int>      op_failed{0};   // DSP batches that answered with an error, not yet reported
     ggml_hexagon_opbatch* op_batch;
     ggml_hexagon_opqueue* op_queue;
 
@@ -2767,7 +2769,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         if (rsp.status != HTP_STATUS_OK) {
             GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
-            // TODO: handle errors
+            // Remember it: graph_compute reports GGML_STATUS_FAILED instead of silently succeeding.
+            this->op_failed++;
         }
 
         op_queue->pop(rsp, dbuf);
@@ -4050,6 +4053,7 @@ static bool ggml_hexagon_precompute_int_hmx_mm_params(
     kparams->m_chunk     = L.mc;
     kparams->n_chunk     = L.nct;
     kparams->vtcm_size   = (int) sess->vtcm_size;
+    kparams->pipeline    = opt_mm_int_fi;    // unused by this kernel otherwise: fault injection (0 = off)
 
     static bool announced = false;
     if (!announced) {
@@ -5563,6 +5567,12 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         sess->enqueue_op(node);
     }
 
+    // Execution is asynchronous: a DSP error seen while flushing (this graph's earlier batches or a
+    // previous graph's) is reported here rather than dropped.
+    if (sess->op_failed.exchange(0) != 0) {
+        GGML_LOG_ERROR("ggml-hex: %s: a DSP op batch failed; graph compute reports failure\n", sess->c_name());
+        return GGML_STATUS_FAILED;
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -6730,6 +6740,21 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mm_chunk  = str_mm_chunk  ? atoi(str_mm_chunk)                    : opt_mm_chunk;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_pvreg  = str_fa_pvreg  ? atoi(str_fa_pvreg)                    : opt_fa_pvreg;
+    if (const char * s = getenv("GGML_HEXAGON_INT_HMX_FI")) {
+        static const struct { const char * name; int code; } fi_names[] = {
+            { "lock", HMXI_FI_LOCK }, { "quant", HMXI_FI_QUANT }, { "cvt", HMXI_FI_CVT }, { "cvt_k", HMXI_FI_CVT_K },
+            { "consume", HMXI_FI_CONSUME }, { "vtcm_plan", HMXI_FI_VTCM_PLAN }, { "vtcm_short", HMXI_FI_VTCM_SHORT },
+            { "cancel", HMXI_FI_CANCEL },
+        };
+        opt_mm_int_fi = -1;
+        for (const auto & f : fi_names) {
+            if (strcmp(s, f.name) == 0) { opt_mm_int_fi = f.code; }
+        }
+        if (opt_mm_int_fi < 0) {
+            GGML_ABORT("ggml-hex: GGML_HEXAGON_INT_HMX_FI=%s is not one of lock|quant|cvt|cvt_k|consume|vtcm_plan|vtcm_short|cancel\n", s);
+        }
+        GGML_LOG_WARN("ggml-hex: integer HMX fault injection armed: %s (fires once per DSP session)\n", s);
+    }
     opt_mm_int_hmx = str_mm_int   ? atoi(str_mm_int)                      : opt_mm_int_hmx;
     opt_mm_int_minrows = str_mm_int_minrows ? atoi(str_mm_int_minrows)    : opt_mm_int_minrows;
     opt_mm_int_nc = str_mm_int_nc ? atoi(str_mm_int_nc)                   : opt_mm_int_nc;

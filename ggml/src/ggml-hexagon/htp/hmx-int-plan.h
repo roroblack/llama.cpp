@@ -18,13 +18,26 @@ struct hmxi_layout {
     size_t off_ring, off_accw, off_rec, off_sa, off_act, off_wt, off_cv, off_dv, off_mid, total;
 };
 
-// k = K (multiple of 32), m = activation rows, n = output columns, nc = consumers, vtcm = bytes.
+// Fault injection codes (test only, GGML_HEXAGON_INT_HMX_FI; carried in htp_mm_kernel_params.pipeline,
+// which the integer kernel does not otherwise use). 0 = off. Each fires at most once per DSP session.
+#define HMXI_FI_LOCK       1   // producer takes the "HMX lock not held" branch   -> -5
+#define HMXI_FI_QUANT      2   // activation quantisation not submitted           -> -7
+#define HMXI_FI_CVT        3   // weight conversion (per column tile) not submitted -> -8
+#define HMXI_FI_CVT_K      4   // weight conversion (K runs) not submitted        -> -8
+#define HMXI_FI_CONSUME    5   // consumers not submitted after the producer push -> -9
+#define HMXI_FI_VTCM_PLAN  6   // planner given a 1-byte budget                   -> -3
+#define HMXI_FI_VTCM_SHORT 7   // usable VTCM one byte short of the plan          -> -3
+#define HMXI_FI_CANCEL     8   // producer aborts after the first published segment -> -10
+
+// k = K (multiple of 32), m = activation rows, n = output columns, nc = consumers, vtcm = bytes,
+// seg_cap = blocks per K segment (0 = HMXI_SEG). Host and DSP must pass the same seg_cap.
 // Returns 0 when not even one 32-row chunk and one column tile fit.
-static inline int hmxi_plan(int k, int m, int n, int nc, size_t vtcm, struct hmxi_layout * L) {
+static inline int hmxi_plan_seg(int k, int m, int n, int nc, size_t vtcm, int seg_cap, struct hmxi_layout * L) {
     if (k <= 0 || (k % 32) != 0 || m <= 0 || n <= 0 || nc < 1) return 0;
     if (nc > HMXI_MAXW) nc = HMXI_MAXW;
+    const int segc = (seg_cap > 0 && seg_cap < HMXI_SEG) ? seg_cap : HMXI_SEG;
     L->B    = k / 32;
-    L->seg  = L->B < HMXI_SEG ? L->B : HMXI_SEG;
+    L->seg  = L->B < segc ? L->B : segc;
     L->nseg = (L->B + L->seg - 1) / L->seg;
     L->nc   = nc;
     // Order keeps every tile area 2 KB aligned from an aligned base (ring slots and activation tiles
@@ -62,6 +75,10 @@ static inline int hmxi_plan(int k, int m, int n, int nc, size_t vtcm, struct hmx
     L->off_sa  = off; off += HMXI_MAXMC * 4;
     L->total = off;
     return off <= vtcm;
+}
+
+static inline int hmxi_plan(int k, int m, int n, int nc, size_t vtcm, struct hmxi_layout * L) {
+    return hmxi_plan_seg(k, m, n, nc, vtcm, 0, L);
 }
 
 #endif /* HMX_INT_PLAN_H */
