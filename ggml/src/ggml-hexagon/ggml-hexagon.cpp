@@ -107,6 +107,7 @@ static int    opt_mm_int_nc = 0;       // integer HMX consumer threads (0 = all 
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_pvreg  = 0; // 1 = HVX flash-attn PV keeps the f32 accumulator in registers per K/V block
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
+static int    opt_async_status = 0; // 1 = graph_compute returns before its batches finish (old behaviour)
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -5567,8 +5568,12 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         sess->enqueue_op(node);
     }
 
-    // Execution is asynchronous: a DSP error seen while flushing (this graph's earlier batches or a
-    // previous graph's) is reported here rather than dropped.
+    // Codex q32: the last batch's answer can arrive only in a later synchronize(), so wait for the batches
+    // this graph queued before judging it; GGML_HEXAGON_ASYNC_STATUS=1 keeps the old return-immediately
+    // behaviour (a failure then surfaces on a later call) for A/B timing.
+    if (!opt_async_status) {
+        sess->flush(true);
+    }
     if (sess->op_failed.exchange(0) != 0) {
         GGML_LOG_ERROR("ggml-hex: %s: a DSP op batch failed; graph compute reports failure\n", sess->c_name());
         return GGML_STATUS_FAILED;
@@ -6740,6 +6745,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mm_chunk  = str_mm_chunk  ? atoi(str_mm_chunk)                    : opt_mm_chunk;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_pvreg  = str_fa_pvreg  ? atoi(str_fa_pvreg)                    : opt_fa_pvreg;
+    if (const char * s = getenv("GGML_HEXAGON_ASYNC_STATUS")) { opt_async_status = atoi(s); }
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_FI")) {
         static const struct { const char * name; int code; } fi_names[] = {
             { "lock", HMXI_FI_LOCK }, { "quant", HMXI_FI_QUANT }, { "cvt", HMXI_FI_CVT }, { "cvt_k", HMXI_FI_CVT_K },
