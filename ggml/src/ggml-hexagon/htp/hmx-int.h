@@ -33,6 +33,8 @@
 #include <hexagon_protos.h>
 #include <hvx_hexagon_protos.h>
 
+#include "hvx-base.h"   // hvx_q4_0_tile_to_legacy(): q4_0 tiles are stored in vrmpy order
+
 #include "hmx-int-plan.h"
 
 // ------------------------------------------------------------------------------------------------
@@ -104,7 +106,8 @@ static void __attribute__((noinline)) hmxi_quant_pair(const float * x0, const fl
 }
 
 // ------------------------------------------------------------------------------------------------
-// Weights: one host-repacked Q4_0 tile (576 B: byte[cp*32+n] = q[n][2cp] | q[n][2cp+1] << 4, then
+// Weights: one host-repacked Q4_0 tile (576 B; since 2026-09 the 512 quant bytes are stored in vrmpy order,
+// so hvx_q4_0_tile_to_legacy() restores the old byte[cp*32+n] = q[n][2cp] | q[n][2cp+1] << 4 order first), then
 // 32 fp16 d) -> int8 HMX tile (q - 8), cv (word c = C | C<<16, C = 128*sum w mod 2^16), dv (256*d).
 // Every other tile is only 64-byte aligned in DDR: unaligned loads; the scale load starts at byte 448
 // so nothing past the tile is read.
@@ -115,7 +118,7 @@ static void __attribute__((noinline)) hmxi_cvt_tile(const uint8_t * src, HVX_Vec
     HVX_Vector       sumq = Q6_V_vzero();
 #pragma unroll
     for (int v = 0; v < 4; v++) {
-        HVX_Vector     x  = *(const HVX_UVector *) (src + v * 128);
+        HVX_Vector     x  = hvx_q4_0_tile_to_legacy(*(const HVX_UVector *) (src + v * 128));
         HVX_Vector     lo = Q6_V_vand_VV(x, k0f);
         HVX_Vector     hi = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(x, 4), k0f);
         HVX_VectorPair p  = Q6_W_vshuff_VVR(hi, lo, -1);

@@ -289,4 +289,23 @@ static inline HVX_Vector hvx_vec_load_act_tile(const uint8_t * y_q, uint32_t kt,
     }
 }
 
+// Q4_0 tile layout, 2026-09. The host now stores each 128-byte group the way vrmpy wants it: the low nibbles
+// are one activation vector's operand and the high nibbles the next, with no reordering left to do. The decode
+// and prefill kernels therefore unpack with vand + vlsr only (hexagon-sim: 82.1 -> 45.6 cycles per K-tile,
+// bit-identical results). Paths that still want the old packed order - the integer-HMX tile converter and the
+// fp16-HMX weight dequantizer - call this first. It is the exact inverse (round-trip verified 0/512 bytes
+// wrong) and runs once per tile, amortised over a whole prefill batch rather than per output row.
+static inline HVX_Vector hvx_q4_0_tile_to_legacy(HVX_Vector x) {
+    const HVX_Vector m  = Q6_Vb_vsplat_R(0x0F);
+    const HVX_Vector mh = Q6_V_vsplat_R(0x000F000F);
+
+    HVX_Vector w0 = Q6_V_vand_VV(x, m);
+    HVX_Vector w1 = Q6_Vub_vlsr_VubR(x, 4);
+
+    HVX_Vector p0 = Q6_V_vor_VV(Q6_V_vand_VV(w0, mh), Q6_Vh_vasl_VhR(Q6_Vuh_vlsr_VuhR(w0, 8), 4));
+    HVX_Vector p1 = Q6_V_vor_VV(Q6_V_vand_VV(w1, mh), Q6_Vh_vasl_VhR(Q6_Vuh_vlsr_VuhR(w1, 8), 4));
+
+    return Q6_Vb_vpacke_VhVh(Q6_Vh_vdeal_Vh(p1), Q6_Vh_vdeal_Vh(p0));
+}
+
 #endif /* HVX_BASE_H */

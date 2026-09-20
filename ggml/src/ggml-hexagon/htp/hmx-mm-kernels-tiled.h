@@ -49,10 +49,11 @@ static void dequantize_tiled_weight_to_fp16_task_q4_0(
         HVX_Vector v_scale_duplicated = Q6_V_lo_W(Q6_W_vshuff_VVR(v_sc, v_sc, -2));
 
         // Load all 4 groups in parallel
-        HVX_Vector vq0 = hvx_vmem(tile_src + 0 * 128);
-        HVX_Vector vq1 = hvx_vmem(tile_src + 1 * 128);
-        HVX_Vector vq2 = hvx_vmem(tile_src + 2 * 128);
-        HVX_Vector vq3 = hvx_vmem(tile_src + 3 * 128);
+        // tiles are stored in vrmpy order since 2026-09; restore the packed order this code expects
+        HVX_Vector vq0 = hvx_q4_0_tile_to_legacy(hvx_vmem(tile_src + 0 * 128));
+        HVX_Vector vq1 = hvx_q4_0_tile_to_legacy(hvx_vmem(tile_src + 1 * 128));
+        HVX_Vector vq2 = hvx_q4_0_tile_to_legacy(hvx_vmem(tile_src + 2 * 128));
+        HVX_Vector vq3 = hvx_q4_0_tile_to_legacy(hvx_vmem(tile_src + 3 * 128));
 
         // Nibble extraction
         HVX_Vector v_lo0 = Q6_V_vand_VV(vq0, mask_h4);
