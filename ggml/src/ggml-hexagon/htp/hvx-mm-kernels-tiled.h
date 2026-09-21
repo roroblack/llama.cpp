@@ -394,6 +394,56 @@ static inline HVX_VectorPair accum_4bit_32x2_lut(
     return Q6_W_vcombine_VV(v_sum1, v_sum0);
 }
 
+// IQ4_NL shares repack_q4_0_tiled() with Q4_0, so its tiles now carry the new
+// pre-shuffled nibble order. mxfp4 has its own repack and must NOT be converted,
+// hence these separate _relayout twins instead of changing the _lut functions.
+static inline HVX_Vector accum_4bit_32x1_lut_relayout(
+    const HVX_Vector * restrict vptr,
+    const HVX_Vector * restrict v_act,
+    HVX_Vector mask_h4,
+    HVX_Vector lut
+) {
+    HVX_Vector v_sum0 = Q6_V_vzero();
+    HVX_Vector v_sum1 = Q6_V_vzero();
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        HVX_VectorPair v_W_pair = unpack_and_interleave_4bit_x2(hvx_q4_0_tile_to_legacy(vptr[i]), mask_h4);
+        HVX_Vector v_W0 = Q6_Vb_vlut32_VbVbI(Q6_V_lo_W(v_W_pair), lut, 0);
+        HVX_Vector v_W1 = Q6_Vb_vlut32_VbVbI(Q6_V_hi_W(v_W_pair), lut, 0);
+        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W0, v_act[i * 2 + 0]);
+        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W1, v_act[i * 2 + 1]);
+    }
+
+    return Q6_Vw_vadd_VwVw(v_sum0, v_sum1);
+}
+
+static inline HVX_VectorPair accum_4bit_32x2_lut_relayout(
+    const HVX_Vector * restrict vptr,
+    const HVX_Vector * restrict v_act0,
+    const HVX_Vector * restrict v_act1,
+    HVX_Vector mask_h4,
+    HVX_Vector lut
+) {
+    HVX_Vector v_sum0 = Q6_V_vzero();
+    HVX_Vector v_sum1 = Q6_V_vzero();
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        HVX_VectorPair v_W_pair = unpack_and_interleave_4bit_x2(hvx_q4_0_tile_to_legacy(vptr[i]), mask_h4);
+        HVX_Vector v_W0 = Q6_Vb_vlut32_VbVbI(Q6_V_lo_W(v_W_pair), lut, 0);
+        HVX_Vector v_W1 = Q6_Vb_vlut32_VbVbI(Q6_V_hi_W(v_W_pair), lut, 0);
+
+        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W0, v_act0[i * 2 + 0]);
+        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W1, v_act0[i * 2 + 1]);
+
+        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W0, v_act1[i * 2 + 0]);
+        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W1, v_act1[i * 2 + 1]);
+    }
+
+    return Q6_W_vcombine_VV(v_sum1, v_sum0);
+}
+
 static inline HVX_Vector accum_q8_0_32x1(
     const HVX_Vector * restrict vptr,
     const HVX_Vector * restrict v_act
@@ -845,7 +895,7 @@ static void tiled_vec_dot_iq4nl_32x1(const uint32_t n, float * restrict s, const
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
         const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + kt * 1152);
 
-        HVX_Vector v_sum = accum_4bit_32x1_lut(vptr, v_act, mask_h4, lut);
+        HVX_Vector v_sum = accum_4bit_32x1_lut_relayout(vptr, v_act, mask_h4, lut);
         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
 
         HVX_Vector v_scale_w = vptr[4];
@@ -884,8 +934,8 @@ static void tiled_vec_dot_iq4nl_32x2(const uint32_t n, float * restrict s0, floa
         const HVX_Vector * restrict v_act0_1 = (const HVX_Vector *) (y0_q + (kt + 1) * 1152);
         const HVX_Vector * restrict v_act1_1 = (const HVX_Vector *) (y1_q + (kt + 1) * 1152);
 
-        HVX_VectorPair v_sums0 = accum_4bit_32x2_lut(vptr0, v_act0_0, v_act1_0, mask_h4, lut);
-        HVX_VectorPair v_sums1 = accum_4bit_32x2_lut(vptr1, v_act0_1, v_act1_1, mask_h4, lut);
+        HVX_VectorPair v_sums0 = accum_4bit_32x2_lut_relayout(vptr0, v_act0_0, v_act1_0, mask_h4, lut);
+        HVX_VectorPair v_sums1 = accum_4bit_32x2_lut_relayout(vptr1, v_act0_1, v_act1_1, mask_h4, lut);
 
         HVX_Vector v_sum_c0_0 = Q6_V_lo_W(v_sums0);
         HVX_Vector v_sum_c1_0 = Q6_V_hi_W(v_sums0);
@@ -923,7 +973,7 @@ static void tiled_vec_dot_iq4nl_32x2(const uint32_t n, float * restrict s0, floa
         const HVX_Vector * restrict v_act0 = (const HVX_Vector *) (y0_q + kt * 1152);
         const HVX_Vector * restrict v_act1 = (const HVX_Vector *) (y1_q + kt * 1152);
 
-        HVX_VectorPair v_sums = accum_4bit_32x2_lut(vptr, v_act0, v_act1, mask_h4, lut);
+        HVX_VectorPair v_sums = accum_4bit_32x2_lut_relayout(vptr, v_act0, v_act1, mask_h4, lut);
         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
         HVX_Vector v_sum_c1 = Q6_V_hi_W(v_sums);
 

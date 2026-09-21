@@ -787,7 +787,7 @@ static void flat_vec_dot_iq4nl_32x1(const uint32_t n, float * restrict s, const 
         v_act_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 24), v_repl_ctrl);
         v_act_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 28), v_repl_ctrl);
 
-        HVX_Vector v_sum = accum_4bit_32x1_lut(vptr, v_act_rep, mask_h4, lut);
+        HVX_Vector v_sum = accum_4bit_32x1_lut_relayout(vptr, v_act_rep, mask_h4, lut);
         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
 
         HVX_Vector v_scale_w = vptr[4];
@@ -867,7 +867,7 @@ static void flat_vec_dot_iq4nl_32x2(const uint32_t n, float * restrict s0, float
         v_act1_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 24), v_repl_ctrl);
         v_act1_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 28), v_repl_ctrl);
 
-        HVX_VectorPair v_sums = accum_4bit_32x2_lut(vptr, v_act0_rep, v_act1_rep, mask_h4, lut);
+        HVX_VectorPair v_sums = accum_4bit_32x2_lut_relayout(vptr, v_act0_rep, v_act1_rep, mask_h4, lut);
         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
         HVX_Vector v_sum_c1 = Q6_V_hi_W(v_sums);
 
