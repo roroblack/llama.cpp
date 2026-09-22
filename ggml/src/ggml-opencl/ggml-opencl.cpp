@@ -7260,9 +7260,11 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
 // pipeline parallelism off for every device in the run (llama-context.cpp: props.caps.async/events),
 // which is what kept a GPU+NPU split from overlapping on this device.
 //
-// The queue is in-order, so a marker completes only after everything enqueued before it, and a
-// barrier makes everything enqueued after it wait. That is exactly the event contract.
-// sync_with_other_backends() below already uses the same two calls for the multi-GPU case.
+// Recording uses a barrier rather than a marker on purpose. On an in-order queue the two are
+// equivalent, but clEnqueueBarrierWithWaitList is also a synchronization point on an out-of-order
+// queue, so this stays correct if the queue properties ever change (the out-of-order variant is
+// commented out at clCreateCommandQueue today). Waiting is the same barrier with the event in its
+// wait list. ggml_backend_opencl_synchronize() above already uses the same call.
 struct ggml_backend_opencl_event_context {
     cl_event evt = nullptr;
 };
@@ -7289,6 +7291,9 @@ static void ggml_backend_opencl_device_event_free(ggml_backend_dev_t dev, ggml_b
 
 static void ggml_backend_opencl_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
+    if (event == nullptr || event->context == nullptr) {
+        return;
+    }
     auto * event_ctx = static_cast<ggml_backend_opencl_event_context *>(event->context);
     // an event that was never recorded has nothing to wait for
     if (event_ctx->evt != nullptr) {
@@ -7300,13 +7305,13 @@ static void ggml_backend_opencl_event_record(ggml_backend_t backend, ggml_backen
     auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
     auto * event_ctx   = static_cast<ggml_backend_opencl_event_context *>(event->context);
 
-    // the scheduler reuses one event per (backend, copy) every graph, so drop the previous marker
+    // the scheduler reuses one event per (backend, copy) every graph, so drop the previous one
     if (event_ctx->evt != nullptr) {
         CL_CHECK(clReleaseEvent(event_ctx->evt));
         event_ctx->evt = nullptr;
     }
-    CL_CHECK(clEnqueueMarkerWithWaitList(backend_ctx->queue, 0, nullptr, &event_ctx->evt));
-    // the marker has to reach the device, otherwise a waiter on another queue can deadlock
+    CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &event_ctx->evt));
+    // it has to reach the device, otherwise a waiter on another queue can sit on an unsubmitted command
     CL_CHECK(clFlush(backend_ctx->queue));
 }
 
