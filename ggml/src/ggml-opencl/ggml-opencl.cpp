@@ -7254,6 +7254,73 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     CL_CHECK(clReleaseEvent(evt));
 }
 
+// Event support. The scheduler uses these for pipeline parallelism: it records an event after a
+// split finishes on one backend and has the next use of those buffers wait on it, so a later ubatch
+// can start on another device while this one is still running. Without them llama.cpp turns
+// pipeline parallelism off for every device in the run (llama-context.cpp: props.caps.async/events),
+// which is what kept a GPU+NPU split from overlapping on this device.
+//
+// The queue is in-order, so a marker completes only after everything enqueued before it, and a
+// barrier makes everything enqueued after it wait. That is exactly the event contract.
+// sync_with_other_backends() below already uses the same two calls for the multi-GPU case.
+struct ggml_backend_opencl_event_context {
+    cl_event evt = nullptr;
+};
+
+static ggml_backend_event_t ggml_backend_opencl_device_event_new(ggml_backend_dev_t dev) {
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ new ggml_backend_opencl_event_context,
+    };
+}
+
+static void ggml_backend_opencl_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    if (event == nullptr) {
+        return;
+    }
+    auto * event_ctx = static_cast<ggml_backend_opencl_event_context *>(event->context);
+    if (event_ctx->evt != nullptr) {
+        CL_CHECK(clReleaseEvent(event_ctx->evt));
+    }
+    delete event_ctx;
+    delete event;
+}
+
+static void ggml_backend_opencl_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    auto * event_ctx = static_cast<ggml_backend_opencl_event_context *>(event->context);
+    // an event that was never recorded has nothing to wait for
+    if (event_ctx->evt != nullptr) {
+        CL_CHECK(clWaitForEvents(1, &event_ctx->evt));
+    }
+}
+
+static void ggml_backend_opencl_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    auto * event_ctx   = static_cast<ggml_backend_opencl_event_context *>(event->context);
+
+    // the scheduler reuses one event per (backend, copy) every graph, so drop the previous marker
+    if (event_ctx->evt != nullptr) {
+        CL_CHECK(clReleaseEvent(event_ctx->evt));
+        event_ctx->evt = nullptr;
+    }
+    CL_CHECK(clEnqueueMarkerWithWaitList(backend_ctx->queue, 0, nullptr, &event_ctx->evt));
+    // the marker has to reach the device, otherwise a waiter on another queue can deadlock
+    CL_CHECK(clFlush(backend_ctx->queue));
+}
+
+static void ggml_backend_opencl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    auto * event_ctx   = static_cast<ggml_backend_opencl_event_context *>(event->context);
+
+    // nothing recorded yet (first graph of a run): nothing to wait for
+    if (event_ctx->evt == nullptr) {
+        return;
+    }
+    CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 1, &event_ctx->evt, nullptr));
+}
+
 // Synchronizes the 'backend_ctx's device with others so that commands
 // enqueued to it won't start until commands in the other devices have
 // completed.
@@ -8889,8 +8956,8 @@ static ggml_backend_i ggml_backend_opencl_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_opencl_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_opencl_event_record,
+    /* .event_wait              = */ ggml_backend_opencl_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -12342,10 +12409,10 @@ static void ggml_backend_opencl_device_get_props(ggml_backend_dev_t dev, struct 
     props->type        = ggml_backend_opencl_device_get_type(dev);
     ggml_backend_opencl_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = ggml_backend_dev_caps {
-        /* .async                 = */ false,
+        /* .async                 = */ true,
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ false,
+        /* .events                = */ true,
         /* .mmap_support          = */ false,
     };
 }
@@ -12422,9 +12489,9 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .supports_op          = */ ggml_backend_opencl_device_supports_op,
     /* .supports_buft        = */ ggml_backend_opencl_device_supports_buft,
     /* .offload_op           = */ NULL,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_opencl_device_event_new,
+    /* .event_free           = */ ggml_backend_opencl_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_opencl_device_event_synchronize,
 };
 }
 
