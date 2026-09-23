@@ -45,6 +45,8 @@ struct htp_fa_context {
 
     // PV with the f32 accumulator in registers across a K/V block (GGML_HEXAGON_FA_PVREG=1, bit-identical)
     bool pv_regacc;
+    bool qf32;      // HTP_FA_FLAG_QF32: QK / PV accumulate in qf32 (GGML_HEXAGON_FA_QF32=1)
+    bool skipmask;  // HTP_FA_FLAG_SKIPMASK: skip fully masked K/V blocks (GGML_HEXAGON_FA_SKIPMASK=1)
 
     struct fastdiv_values src0_div21;
     struct fastdiv_values src0_div1;
@@ -374,7 +376,11 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             uint8_t * v_base = dma_queue_pop(dma).dst; // V
             __fp16  * m_base = mask ? dma_queue_pop(dma).dst : NULL; // M
 
-            if (factx->k->type == HTP_TYPE_Q8_0) {
+            // A block the mask hides completely adds exactly nothing (see hvx_fa_block_all_masked). The DMA schedule
+            // below is left as it is; only the work on the block is skipped.
+            const bool skip_blk = factx->skipmask && m_base && hvx_fa_block_all_masked(m_base, current_block_size);
+
+            if (!skip_blk && factx->k->type == HTP_TYPE_Q8_0) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
                 for (uint32_t r = 0; r < current_block_size; ++r) {
                     __fp16 * row_k = (__fp16 *)(k_base + r * factx->size_k_row_padded);
@@ -382,7 +388,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                 }
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
             }
-            if (factx->v->type == HTP_TYPE_Q8_0) {
+            if (!skip_blk && factx->v->type == HTP_TYPE_Q8_0) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, ir);
                 for (uint32_t r = 0; r < current_block_size; ++r) {
                     __fp16 * row_v = (__fp16 *)(v_base + r * factx->size_v_row_padded);
@@ -396,9 +402,16 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             // Inner loop processing the block from VTCM
             // 1. Compute scores (64 elements FP16)
             HVX_Vector scores_f16 = Q6_V_vzero();
-            if (current_block_size > 0) {
-                HVX_Vector scores0 = hvx_dot_f16_f16_aa_rx32(q_ptr_vtcm, k_base, factx->size_k_row_padded, DK, factx->scale);
-                HVX_Vector scores1 = (current_block_size > 32) ? hvx_dot_f16_f16_aa_rx32(q_ptr_vtcm, k_base + 32 * factx->size_k_row_padded, factx->size_k_row_padded, DK, factx->scale) : Q6_V_vzero();
+            if (!skip_blk && current_block_size > 0) {
+                const uint8_t * k_hi = k_base + 32 * factx->size_k_row_padded;
+                HVX_Vector scores0, scores1;
+                if (factx->qf32) {
+                    scores0 = hvx_dot_f16_f16_aa_rx32_qf(q_ptr_vtcm, k_base, factx->size_k_row_padded, DK, factx->scale);
+                    scores1 = (current_block_size > 32) ? hvx_dot_f16_f16_aa_rx32_qf(q_ptr_vtcm, k_hi, factx->size_k_row_padded, DK, factx->scale) : Q6_V_vzero();
+                } else {
+                    scores0 = hvx_dot_f16_f16_aa_rx32(q_ptr_vtcm, k_base, factx->size_k_row_padded, DK, factx->scale);
+                    scores1 = (current_block_size > 32) ? hvx_dot_f16_f16_aa_rx32(q_ptr_vtcm, k_hi, factx->size_k_row_padded, DK, factx->scale) : Q6_V_vzero();
+                }
                 scores_f16 = hvx_vec_f32_to_f16(scores0, scores1);
             }
 
@@ -450,7 +463,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_SFM, ir);
-            {
+            if (!skip_blk) {
                 // 4. Online Softmax Update
                 HVX_Vector M_new_vec = Q6_Vsf_vmax_VsfVsf(v_max, M_vec);
                 HVX_Vector diff_vec  = HVX_OP_SUB_F32(M_vec, M_new_vec);
@@ -485,7 +498,11 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                 const uint8_t * v_ptr = v_base;
 
                 if (factx->pv_regacc) {
-                    hvx_pv_block_regacc(VKQ32, v_base, factx->size_v_row_padded, P, current_block_size, DV);
+                    if (factx->qf32) {
+                        hvx_pv_block_regacc_qf(VKQ32, v_base, factx->size_v_row_padded, P, current_block_size, DV);
+                    } else {
+                        hvx_pv_block_regacc(VKQ32, v_base, factx->size_v_row_padded, P, current_block_size, DV);
+                    }
                 } else
                 for (uint32_t j = 0; j < current_block_size; j += 2) {
                     if (j + 1 == current_block_size) {
@@ -2411,6 +2428,8 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     struct htp_fa_context factx;
     factx.octx = octx;
     factx.pv_regacc = kparams->pv_regacc != 0 && (v->ne[0] % 256) == 0;
+    factx.qf32      = (kparams->fa_flags & HTP_FA_FLAG_QF32) != 0;
+    factx.skipmask  = (kparams->fa_flags & HTP_FA_FLAG_SKIPMASK) != 0;
     factx.k = k;
     factx.v = v;
 

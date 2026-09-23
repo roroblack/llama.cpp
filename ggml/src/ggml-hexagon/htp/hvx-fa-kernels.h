@@ -351,4 +351,158 @@ static inline void hvx_scale_vec_f32_aa(uint8_t * restrict dst, const uint8_t * 
     }
 }
 
+// ---- qf32-accumulating variants (HTP_FA_FLAG_QF32) --------------------------------------------------------------
+// On < v79 hvx_vec_mpyacc_f32_f16 does, for every multiply, vmpy -> two qf32 adds -> two conversions back to IEEE
+// f32, and each conversion waits for its add: the QK loop ran ~1 instruction per packet. These keep the running sums
+// in qf32 and convert once at the end (per dot product for QK, per 64-key block for PV). One rounding instead of one
+// per multiply, so results are not bit-identical to the functions above.
+// Simulator, one thread, one 64-key block, DK = DV = 256 (2026-09-24): QK 4602 -> 2703 cycles, PV 2616 -> 1803.
+// On >= v79 they fall back to the functions above (native IEEE vmpyacc, nothing to gain).
+
+#if __HVX_ARCH__ < 79
+
+static inline HVX_Vector hvx_qf32_pair_sum(HVX_VectorPair m) {
+    return Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(m), Q6_V_hi_W(m));
+}
+
+static inline HVX_Vector hvx_dot_f16_f16_aa_rx4_qf(const void * restrict y,
+                                                   const uint8_t * restrict x,
+                                                   const size_t stride_x,
+                                                   const size_t nvec,
+                                                   const size_t nloe) {
+    const HVX_Vector * restrict vx0 = (const HVX_Vector * restrict) x;
+    const HVX_Vector * restrict vx1 = (const HVX_Vector * restrict) (x + stride_x);
+    const HVX_Vector * restrict vx2 = (const HVX_Vector * restrict) (x + stride_x * 2);
+    const HVX_Vector * restrict vx3 = (const HVX_Vector * restrict) (x + stride_x * 3);
+    const HVX_Vector * restrict vy  = (const HVX_Vector * restrict) y;
+
+    // qf32 zero is the all-zero vector
+    HVX_Vector a0 = Q6_V_vzero(), a1 = Q6_V_vzero(), a2 = Q6_V_vzero(), a3 = Q6_V_vzero();
+
+    uint32_t i = 0;
+    if (nvec > 0) {
+        const HVX_Vector y_hf = vy[0];
+        a0 = hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(vx0[0], y_hf));
+        a1 = hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(vx1[0], y_hf));
+        a2 = hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(vx2[0], y_hf));
+        a3 = hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(vx3[0], y_hf));
+        for (i = 1; i < nvec; i++) {
+            const HVX_Vector yv = vy[i];
+            a0 = Q6_Vqf32_vadd_Vqf32Vqf32(a0, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(vx0[i], yv)));
+            a1 = Q6_Vqf32_vadd_Vqf32Vqf32(a1, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(vx1[i], yv)));
+            a2 = Q6_Vqf32_vadd_Vqf32Vqf32(a2, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(vx2[i], yv)));
+            a3 = Q6_Vqf32_vadd_Vqf32Vqf32(a3, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(vx3[i], yv)));
+        }
+    }
+
+    if (nloe) {
+        HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 2);
+        HVX_Vector     y_hf  = Q6_V_vand_QV(bmask, vy[i]);
+        a0 = Q6_Vqf32_vadd_Vqf32Vqf32(a0, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(Q6_V_vand_QV(bmask, vx0[i]), y_hf)));
+        a1 = Q6_Vqf32_vadd_Vqf32Vqf32(a1, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(Q6_V_vand_QV(bmask, vx1[i]), y_hf)));
+        a2 = Q6_Vqf32_vadd_Vqf32Vqf32(a2, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(Q6_V_vand_QV(bmask, vx2[i]), y_hf)));
+        a3 = Q6_Vqf32_vadd_Vqf32Vqf32(a3, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(Q6_V_vand_QV(bmask, vx3[i]), y_hf)));
+    }
+
+    HVX_Vector_x4 rsum0123 = { .v = { Q6_Vsf_equals_Vqf32(a0), Q6_Vsf_equals_Vqf32(a1),
+                                      Q6_Vsf_equals_Vqf32(a2), Q6_Vsf_equals_Vqf32(a3) } };
+    return hvx_vec_reduce_sum_f32x4(rsum0123);
+}
+
+static inline HVX_Vector hvx_dot_f16_f16_aa_rx32_qf(const void * restrict y,
+                                                    const uint8_t * restrict x,
+                                                    const size_t stride_x,
+                                                    const size_t n,
+                                                    float        s) {
+    const size_t nvec = n / VLEN_FP16;
+    const size_t nloe = n % VLEN_FP16;
+
+    HVX_Vector   sums = Q6_V_vzero();
+    const size_t stride_x_4 = stride_x * 4;
+    for (uint32_t j = 0; j < VLEN_FP32; j += 4) {
+        HVX_Vector     sums_x4 = hvx_dot_f16_f16_aa_rx4_qf(y, x, stride_x, nvec, nloe);
+        HVX_VectorPred pred    = Q6_Q_vsetq_R(j * SIZEOF_FP32);
+        sums                   = Q6_V_vmux_QVV(pred, sums, sums_x4);
+        x += stride_x_4;
+    }
+
+    return HVX_OP_MUL_F32(hvx_vec_splat_f32(s), sums);
+}
+
+#define HVX_PV_QF_ACC(k, xv, S)                                         \
+    do {                                                                \
+        const HVX_VectorPair m_ = Q6_Wqf32_vmpy_VhfVhf(Q6_Vh_vshuff_Vh(xv), S); \
+        l##k = Q6_Vqf32_vadd_Vqf32Vqf32(l##k, Q6_V_lo_W(m_));           \
+        h##k = Q6_Vqf32_vadd_Vqf32Vqf32(h##k, Q6_V_hi_W(m_));           \
+    } while (0)
+
+// Same traversal as hvx_pv_block_regacc; the four accumulator pairs enter as f32 (one qf32 add each), stay qf32
+// through the block and are converted back once. Caller guarantees DV % 256 == 0.
+static inline void hvx_pv_block_regacc_qf(float * restrict y, const uint8_t * restrict v_base, size_t v_stride,
+                                          HVX_Vector P, uint32_t nkeys, uint32_t DV) {
+    HVX_VectorPair * restrict vy_p = (HVX_VectorPair *) y;
+    const uint32_t npairs = DV / VLEN_FP16;
+    const HVX_Vector z = Q6_V_vzero();
+
+    for (uint32_t i0 = 0; i0 < npairs; i0 += 4) {
+        HVX_Vector l0 = Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vy_p[i0 + 0]), z), h0 = Q6_Vqf32_vadd_VsfVsf(Q6_V_hi_W(vy_p[i0 + 0]), z);
+        HVX_Vector l1 = Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vy_p[i0 + 1]), z), h1 = Q6_Vqf32_vadd_VsfVsf(Q6_V_hi_W(vy_p[i0 + 1]), z);
+        HVX_Vector l2 = Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vy_p[i0 + 2]), z), h2 = Q6_Vqf32_vadd_VsfVsf(Q6_V_hi_W(vy_p[i0 + 2]), z);
+        HVX_Vector l3 = Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vy_p[i0 + 3]), z), h3 = Q6_Vqf32_vadd_VsfVsf(Q6_V_hi_W(vy_p[i0 + 3]), z);
+
+        const uint8_t * v_ptr = v_base;
+        uint32_t j = 0;
+        for (; j + 1 < nkeys; j += 2) {
+            const HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
+            const HVX_Vector S1 = hvx_vec_repl_f16(Q6_V_vror_VR(P, (j + 1) * 2));
+            const HVX_Vector * vx0 = (const HVX_Vector *) v_ptr + i0;
+            const HVX_Vector * vx1 = (const HVX_Vector *) (v_ptr + v_stride) + i0;
+            HVX_PV_QF_ACC(0, vx0[0], S0); HVX_PV_QF_ACC(0, vx1[0], S1);
+            HVX_PV_QF_ACC(1, vx0[1], S0); HVX_PV_QF_ACC(1, vx1[1], S1);
+            HVX_PV_QF_ACC(2, vx0[2], S0); HVX_PV_QF_ACC(2, vx1[2], S1);
+            HVX_PV_QF_ACC(3, vx0[3], S0); HVX_PV_QF_ACC(3, vx1[3], S1);
+            v_ptr += 2 * v_stride;
+        }
+        if (j < nkeys) {
+            const HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
+            const HVX_Vector * vx0 = (const HVX_Vector *) v_ptr + i0;
+            HVX_PV_QF_ACC(0, vx0[0], S0);
+            HVX_PV_QF_ACC(1, vx0[1], S0);
+            HVX_PV_QF_ACC(2, vx0[2], S0);
+            HVX_PV_QF_ACC(3, vx0[3], S0);
+        }
+
+        vy_p[i0 + 0] = Q6_W_vcombine_VV(Q6_Vsf_equals_Vqf32(h0), Q6_Vsf_equals_Vqf32(l0));
+        vy_p[i0 + 1] = Q6_W_vcombine_VV(Q6_Vsf_equals_Vqf32(h1), Q6_Vsf_equals_Vqf32(l1));
+        vy_p[i0 + 2] = Q6_W_vcombine_VV(Q6_Vsf_equals_Vqf32(h2), Q6_Vsf_equals_Vqf32(l2));
+        vy_p[i0 + 3] = Q6_W_vcombine_VV(Q6_Vsf_equals_Vqf32(h3), Q6_Vsf_equals_Vqf32(l3));
+    }
+}
+
+#undef HVX_PV_QF_ACC
+
+#else
+
+#define hvx_dot_f16_f16_aa_rx32_qf hvx_dot_f16_f16_aa_rx32
+#define hvx_pv_block_regacc_qf     hvx_pv_block_regacc
+
+#endif
+
+// True when every one of the first nkeys mask entries is -inf, i.e. the whole K/V block contributes exactly zero:
+// its scores become -65504 + s after the -inf -> -65504 substitution, the running max does not move (it starts at
+// -10000), so the rescale factor is exp2(0) = 1 and P = exp2(<= -80000) = 0 (HTP_FA_FLAG_SKIPMASK).
+static inline bool hvx_fa_block_all_masked(const __fp16 * restrict m, uint32_t nkeys) {
+    const HVX_Vector     vinf = Q6_Vh_vsplat_R(0xFC00);
+    const HVX_VectorPred keep = Q6_Q_vsetq2_R(nkeys * sizeof(__fp16));
+    // lanes past nkeys count as masked
+    const HVX_Vector     mv   = Q6_V_vmux_QVV(keep, *(const HVX_UVector *) m, vinf);
+    const HVX_VectorPred inf  = Q6_Q_vcmp_eq_VhVh(mv, vinf);
+    HVX_Vector live = Q6_V_vmux_QVV(inf, Q6_V_vzero(), Q6_V_vsplat_R(1));
+    for (int s = 64; s >= 4; s >>= 1) {
+        live = Q6_V_vor_VV(live, Q6_V_vror_VR(live, s));
+    }
+    union { HVX_Vector v; int32_t w[32]; } u = { live };
+    return u.w[0] == 0;
+}
+
 #endif /* HVX_FA_KERNELS_H */

@@ -82,7 +82,11 @@ struct htp_fa_kernel_params {
     } u;
 
     uint8_t  pv_regacc;          // HVX: PV accumulator kept in registers per K/V block (bit-identical), appended
+    uint8_t  fa_flags;           // HVX: HTP_FA_FLAG_* (appended)
 };
+
+#define HTP_FA_FLAG_QF32     0x1 // accumulate QK / PV in qf32 on < v79 and convert once (not bit-identical)
+#define HTP_FA_FLAG_SKIPMASK 0x2 // skip K/V blocks the mask hides completely
 
 #if defined(__cplusplus)
 static_assert(sizeof(struct htp_fa_kernel_params) <= 128, "htp_fa_kernel_params is too large for kernel_params blob");
