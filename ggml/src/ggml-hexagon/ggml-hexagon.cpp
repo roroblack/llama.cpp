@@ -112,10 +112,14 @@ static int    opt_fa_pvreg  = 1; // 1 = HVX flash-attn PV keeps the f32 accumula
                                  // (default on since 2026-09-23: FA 1.16x and logits bit-identical on SM8735 (09-11);
                                  //  pp512 +6.0% with tg64 unchanged, alternating 3 rounds; GGML_HEXAGON_FA_PVREG=0 turns it off.
                                  //  Taken only when DV % 256 == 0 - other head sizes keep the old loop.)
-static int    opt_fa_qf32   = 0; // 1 = v73 HVX flash-attn keeps QK and PV accumulators in qf32 and converts once
+static int    opt_fa_qf32   = 1; // 1 = v73 HVX flash-attn keeps QK and PV accumulators in qf32 and converts once
+                                 // (default on since 2026-09-24: device, alternating, with SKIPMASK: pp512 88.4 -> 102-106,
+                                 //  pp2048 63 -> 80-82, tg64 unchanged; FLASH_ATTN_EXT 2465/2465; perplexity within 0.2% of
+                                 //  the CPU reference like every other variant)
                                  // (sim 2026-09-24, one 64-key block DK=DV=256: QK 4602 -> 2703, PV 2616 -> 1803 cycles;
                                  //  not bit-identical - one rounding instead of one per multiply). GGML_HEXAGON_FA_QF32.
-static int    opt_fa_skipmask = 0; // 1 = HVX flash-attn skips K/V blocks the mask hides completely (causal future,
+static int    opt_fa_skipmask = 1; // 1 = HVX flash-attn skips K/V blocks the mask hides completely (causal future,
+                                 // (default on since 2026-09-24; it also fixed the 3 long-standing kv=16384 FA failures),
                                  // outside the sliding window). Their contribution is exactly zero. GGML_HEXAGON_FA_SKIPMASK.
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
 static int    opt_async_status = 0; // 1 = graph_compute returns before its batches finish (old behaviour)
