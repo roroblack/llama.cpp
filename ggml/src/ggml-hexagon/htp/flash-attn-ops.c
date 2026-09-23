@@ -473,9 +473,25 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                 HVX_Vector ms_f16     = hvx_vec_exp2_f16(diff_base2);
                 HVX_Vector ms_vec     = Q6_V_lo_W(hvx_vec_f16_to_f32(ms_f16));
 
+                // HTP_FA_FLAG_SKIPMASK also takes the rescale out when the running max did not move. The factor is
+                // then exp2(0), and hvx_vec_exp2_f16(0) returns 1.00097656 (0x3c01, one f16 ulp high: x - 0.5 rounds
+                // to k = -1 and the polynomial at 1 gives 2.002), so every such block multiplied the accumulator by
+                // 1.001. That is why skipping fully masked blocks was not bit-identical (perplexity 12.7498 ->
+                // 12.7381, CPU reference 12.7648; sim + device 2026-09-24).
+                bool m_same = false;
+                if (factx->skipmask) {
+                    union { HVX_Vector v; uint32_t w[32]; } mo = { M_vec }, mn = { M_new_vec };
+                    m_same = (mo.w[0] == mn.w[0]);  // both are splats
+                }
+                if (m_same) {
+                    ms_vec = hvx_vec_splat_f32(1.0f);
+                }
+
                 M_vec = M_new_vec;
 
-                hvx_scale_vec_f32_aa((uint8_t *) VKQ32, (const uint8_t *) VKQ32, DV, ms_vec);
+                if (!m_same) {
+                    hvx_scale_vec_f32_aa((uint8_t *) VKQ32, (const uint8_t *) VKQ32, DV, ms_vec);
+                }
 
                 // Compute P = exp2((S - M) * log2(e)) in FP16
                 HVX_Vector v_m_vec_f16 = hvx_vec_f32_to_f16(M_vec, M_vec);
