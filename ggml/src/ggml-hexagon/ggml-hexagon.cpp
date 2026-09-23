@@ -108,7 +108,10 @@ static int    opt_mm_int_hmx = 1;      // integer HMX Q4_0 matmul where the DSP'
 static int    opt_mm_int_minrows = 32; // integer HMX only for MUL_MATs with at least this many rows
 static int    opt_mm_int_nc = 0;       // integer HMX consumer threads (0 = all HVX threads)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
-static int    opt_fa_pvreg  = 0; // 1 = HVX flash-attn PV keeps the f32 accumulator in registers per K/V block
+static int    opt_fa_pvreg  = 1; // 1 = HVX flash-attn PV keeps the f32 accumulator in registers per K/V block
+                                 // (default on since 2026-09-23: FA 1.16x and logits bit-identical on SM8735 (09-11);
+                                 //  pp512 +6.0% with tg64 unchanged, alternating 3 rounds; GGML_HEXAGON_FA_PVREG=0 turns it off.
+                                 //  Taken only when DV % 256 == 0 - other head sizes keep the old loop.)
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
 static int    opt_async_status = 0; // 1 = graph_compute returns before its batches finish (old behaviour)
 static int    opt_batch_deadline_s = 60; // a DSP batch unanswered this long ends the process (Codex q33a)
