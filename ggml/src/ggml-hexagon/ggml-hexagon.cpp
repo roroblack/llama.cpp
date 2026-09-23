@@ -4658,6 +4658,15 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         return false;
     }
 
+    // An empty product (no output rows) is skipped at compute time (op_is_compute), so there is nothing to refuse.
+    // It was refused (most likely by the chunk-size search, which returns 0 for 0 rows), and that sent the lm-head to the CPU in every
+    // ubatch that needs no logits: the scheduler then copied the 408 MiB tied-embedding weight into a CPU compute
+    // buffer to multiply nothing (llama-server, gemma-4-E2B on SM8735, 2026-09-24: CPU compute buffer
+    // 14 MiB at reserve -> 408 MiB after the first request, splits showed "CPU#token_embd.weight (408M)").
+    if (ggml_is_empty(dst)) {
+        return true;
+    }
+
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) {
         return false;
     }
