@@ -510,7 +510,10 @@ static inline bool hvx_fa_block_all_masked(const __fp16 * restrict m, uint32_t n
     // lanes past nkeys count as masked
     const HVX_Vector     mv   = Q6_V_vmux_QVV(keep, *(const HVX_UVector *) m, vinf);
     const HVX_VectorPred inf  = Q6_Q_vcmp_eq_VhVh(mv, vinf);
-    HVX_Vector live = Q6_V_vmux_QVV(inf, Q6_V_vzero(), Q6_V_vsplat_R(1));
+    // halfword ones: the predicate selects per 16-bit lane. A word splat of 1 (0x00000001) left the odd lanes 0,
+    // so a block whose only live key sat at an odd index was taken for fully masked and skipped (first device run
+    // 2026-09-24: FLASH_ATTN_EXT 2462 -> 2455 passed, perplexity 12.7498 -> 12.7381).
+    HVX_Vector live = Q6_V_vmux_QVV(inf, Q6_V_vzero(), Q6_Vh_vsplat_R(1));
     for (int s = 64; s >= 4; s >>= 1) {
         live = Q6_V_vor_VV(live, Q6_V_vror_VR(live, s));
     }
