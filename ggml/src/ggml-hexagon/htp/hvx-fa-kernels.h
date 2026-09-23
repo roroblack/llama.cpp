@@ -356,7 +356,7 @@ static inline void hvx_scale_vec_f32_aa(uint8_t * restrict dst, const uint8_t * 
 // f32, and each conversion waits for its add: the QK loop ran ~1 instruction per packet. These keep the running sums
 // in qf32 and convert once at the end (per dot product for QK, per 64-key block for PV). One rounding instead of one
 // per multiply, so results are not bit-identical to the functions above.
-// Simulator, one thread, one 64-key block, DK = DV = 256 (2026-09-24): QK 4602 -> 2703 cycles, PV 2616 -> 1803.
+// Simulator, one thread, one 64-key block, DK = DV = 256 (2026-09-24): QK 4602 -> 2121 cycles, PV 2616 -> 1803.
 // On >= v79 they fall back to the functions above (native IEEE vmpyacc, nothing to gain).
 
 #if __HVX_ARCH__ < 79
@@ -365,19 +365,26 @@ static inline HVX_Vector hvx_qf32_pair_sum(HVX_VectorPair m) {
     return Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(m), Q6_V_hi_W(m));
 }
 
-static inline HVX_Vector hvx_dot_f16_f16_aa_rx4_qf(const void * restrict y,
-                                                   const uint8_t * restrict x,
-                                                   const size_t stride_x,
-                                                   const size_t nvec,
-                                                   const size_t nloe) {
+// One level of a transpose-add tree: interleave a and b at w bytes and add the halves (qf32 in, qf32 out).
+static inline HVX_Vector hvx_qf32_tree_level(HVX_Vector a, HVX_Vector b, int w) {
+    const HVX_VectorPair p = Q6_W_vshuff_VVR(b, a, w);
+    return Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(p), Q6_V_hi_W(p));
+}
+
+// Dot products of y with 4 rows of x, left as a qf32 vector where lane 4k + r holds a partial sum of row r
+// (the first two levels of the 32-row tree below).
+static inline HVX_Vector hvx_dot_f16_f16_aa_rx4_qf_partial(const void * restrict y,
+                                                           const uint8_t * restrict x,
+                                                           const size_t stride_x,
+                                                           const size_t nvec,
+                                                           const size_t nloe) {
     const HVX_Vector * restrict vx0 = (const HVX_Vector * restrict) x;
     const HVX_Vector * restrict vx1 = (const HVX_Vector * restrict) (x + stride_x);
     const HVX_Vector * restrict vx2 = (const HVX_Vector * restrict) (x + stride_x * 2);
     const HVX_Vector * restrict vx3 = (const HVX_Vector * restrict) (x + stride_x * 3);
     const HVX_Vector * restrict vy  = (const HVX_Vector * restrict) y;
 
-    // qf32 zero is the all-zero vector
-    HVX_Vector a0 = Q6_V_vzero(), a1 = Q6_V_vzero(), a2 = Q6_V_vzero(), a3 = Q6_V_vzero();
+    HVX_Vector a0 = Q6_V_vzero(), a1 = Q6_V_vzero(), a2 = Q6_V_vzero(), a3 = Q6_V_vzero();  // qf32 zero
 
     uint32_t i = 0;
     if (nvec > 0) {
@@ -404,11 +411,12 @@ static inline HVX_Vector hvx_dot_f16_f16_aa_rx4_qf(const void * restrict y,
         a3 = Q6_Vqf32_vadd_Vqf32Vqf32(a3, hvx_qf32_pair_sum(Q6_Wqf32_vmpy_VhfVhf(Q6_V_vand_QV(bmask, vx3[i]), y_hf)));
     }
 
-    HVX_Vector_x4 rsum0123 = { .v = { Q6_Vsf_equals_Vqf32(a0), Q6_Vsf_equals_Vqf32(a1),
-                                      Q6_Vsf_equals_Vqf32(a2), Q6_Vsf_equals_Vqf32(a3) } };
-    return hvx_vec_reduce_sum_f32x4(rsum0123);
+    return hvx_qf32_tree_level(hvx_qf32_tree_level(a0, a1, 4), hvx_qf32_tree_level(a2, a3, 4), 8);
 }
 
+// 32 dot products (lane j = row j), finished by one 5-level shuffle/add tree instead of a reduce per 4 rows plus
+// a vmux: half the reduction instructions and every level is independent work. Sim, 64-key block, DK = 256:
+// 2121 cycles (reduce-per-4 qf32 2703, as shipped 4602); max |error| vs a double reference 6.3e-7, same as both.
 static inline HVX_Vector hvx_dot_f16_f16_aa_rx32_qf(const void * restrict y,
                                                     const uint8_t * restrict x,
                                                     const size_t stride_x,
@@ -416,17 +424,22 @@ static inline HVX_Vector hvx_dot_f16_f16_aa_rx32_qf(const void * restrict y,
                                                     float        s) {
     const size_t nvec = n / VLEN_FP16;
     const size_t nloe = n % VLEN_FP16;
+    const size_t s4   = stride_x * 4;
 
-    HVX_Vector   sums = Q6_V_vzero();
-    const size_t stride_x_4 = stride_x * 4;
-    for (uint32_t j = 0; j < VLEN_FP32; j += 4) {
-        HVX_Vector     sums_x4 = hvx_dot_f16_f16_aa_rx4_qf(y, x, stride_x, nvec, nloe);
-        HVX_VectorPred pred    = Q6_Q_vsetq_R(j * SIZEOF_FP32);
-        sums                   = Q6_V_vmux_QVV(pred, sums, sums_x4);
-        x += stride_x_4;
-    }
+    const HVX_Vector t0 = hvx_dot_f16_f16_aa_rx4_qf_partial(y, x + 0 * s4, stride_x, nvec, nloe);
+    const HVX_Vector t1 = hvx_dot_f16_f16_aa_rx4_qf_partial(y, x + 1 * s4, stride_x, nvec, nloe);
+    const HVX_Vector t2 = hvx_dot_f16_f16_aa_rx4_qf_partial(y, x + 2 * s4, stride_x, nvec, nloe);
+    const HVX_Vector t3 = hvx_dot_f16_f16_aa_rx4_qf_partial(y, x + 3 * s4, stride_x, nvec, nloe);
+    const HVX_Vector t4 = hvx_dot_f16_f16_aa_rx4_qf_partial(y, x + 4 * s4, stride_x, nvec, nloe);
+    const HVX_Vector t5 = hvx_dot_f16_f16_aa_rx4_qf_partial(y, x + 5 * s4, stride_x, nvec, nloe);
+    const HVX_Vector t6 = hvx_dot_f16_f16_aa_rx4_qf_partial(y, x + 6 * s4, stride_x, nvec, nloe);
+    const HVX_Vector t7 = hvx_dot_f16_f16_aa_rx4_qf_partial(y, x + 7 * s4, stride_x, nvec, nloe);
 
-    return HVX_OP_MUL_F32(hvx_vec_splat_f32(s), sums);
+    const HVX_Vector u0 = hvx_qf32_tree_level(t0, t1, 16), u1 = hvx_qf32_tree_level(t2, t3, 16);
+    const HVX_Vector u2 = hvx_qf32_tree_level(t4, t5, 16), u3 = hvx_qf32_tree_level(t6, t7, 16);
+    const HVX_Vector r  = hvx_qf32_tree_level(hvx_qf32_tree_level(u0, u1, 32), hvx_qf32_tree_level(u2, u3, 32), 64);
+
+    return HVX_OP_MUL_F32(hvx_vec_splat_f32(s), Q6_Vsf_equals_Vqf32(r));
 }
 
 #define HVX_PV_QF_ACC(k, xv, S)                                         \
