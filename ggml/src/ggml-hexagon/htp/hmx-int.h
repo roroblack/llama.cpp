@@ -67,14 +67,25 @@ static inline void hmxi_init_record(uint32_t * rec) {
 // Activations: rows in pairs -> u16 tiles. x0/x1 may be NULL (padding row -> quantised zero = 32768).
 // sa gets max|x| / 32767, or 0 for an all-zero (or padding) row so it contributes exactly 0.
 
-static inline float hmxi_absmax_row(const float * x, int K) {
-    HVX_Vector m = Q6_V_vzero();
+// Four independent max chains, then a rotate-and-max horizontal reduction instead of spilling the vector and
+// comparing 32 words one by one. max is associative and commutative, and the words are |x| bit patterns (sign
+// cleared), so signed-word max orders them exactly as the old scalar loop did: the result is bit-identical
+// (checked in hexagon-sim against the old version, scratchpad gemvsim/pref_sim2.c / pref_sim3.c).
+static inline float hmxi_absmax_row(const float * restrict x, int K) {
     const HVX_Vector mask = Q6_V_vsplat_R(0x7fffffff);
-    for (int i = 0; i < K; i += 32) m = Q6_Vw_vmax_VwVw(m, Q6_V_vand_VV(*(const HVX_UVector *) (x + i), mask));
+    HVX_Vector m0 = Q6_V_vzero(), m1 = Q6_V_vzero(), m2 = Q6_V_vzero(), m3 = Q6_V_vzero();
+    int i = 0;
+    for (; i + 128 <= K; i += 128) {
+        m0 = Q6_Vw_vmax_VwVw(m0, Q6_V_vand_VV(*(const HVX_UVector *) (x + i),      mask));
+        m1 = Q6_Vw_vmax_VwVw(m1, Q6_V_vand_VV(*(const HVX_UVector *) (x + i + 32), mask));
+        m2 = Q6_Vw_vmax_VwVw(m2, Q6_V_vand_VV(*(const HVX_UVector *) (x + i + 64), mask));
+        m3 = Q6_Vw_vmax_VwVw(m3, Q6_V_vand_VV(*(const HVX_UVector *) (x + i + 96), mask));
+    }
+    for (; i < K; i += 32) m0 = Q6_Vw_vmax_VwVw(m0, Q6_V_vand_VV(*(const HVX_UVector *) (x + i), mask));
+    HVX_Vector m = Q6_Vw_vmax_VwVw(Q6_Vw_vmax_VwVw(m0, m1), Q6_Vw_vmax_VwVw(m2, m3));
+    for (int s = 64; s >= 4; s >>= 1) m = Q6_Vw_vmax_VwVw(m, Q6_V_vror_VR(m, s));
     union { HVX_Vector v; int32_t w[32]; } u = { m };
-    int32_t best = 0;
-    for (int i = 0; i < 32; i++) if (u.w[i] > best) best = u.w[i];
-    union { int32_t i; float f; } r = { best };
+    union { int32_t i; float f; } r = { u.w[0] > 0 ? u.w[0] : 0 };
     return r.f;
 }
 
@@ -85,9 +96,51 @@ static inline HVX_Vector hmxi_quant_block(const float * x, HVX_Vector vinv) {
     return Q6_Vw_vadd_VwVw(q, Q6_V_vsplat_R(32768));
 }
 
+// Both rows present - every pair except the last one of an odd row count. The general loop below issued ONE HVX op
+// per packet and started row 1's load only after row 0's whole vmpy -> sf -> w -> max -> min -> add chain (seen in
+// the disassembly): the NULL test inside hmxi_quant_block splits the loop into blocks and float* x vs uint8_t* act_rt
+// may alias, so the scheduler could not overlap anything. Here there is no branch, the pointers are restrict, and two
+// blocks x two rows = four independent chains are written side by side. Same instructions per value, so the output
+// is bit-identical. hexagon-sim, K=1536: 3159 -> 1533 cycles per row pair (-51.5%), 2.14 -> 2.84 ops per packet.
+#define HMXI_QCONV(xv, vinv) Q6_Vw_equals_Vsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf((xv), (vinv))))
+#define HMXI_QCLAMP(q)       Q6_Vw_vadd_VwVw(Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw((q), qlo), qhi), qoff)
+static void __attribute__((noinline)) hmxi_quant_pair2(const float * restrict x0, const float * restrict x1, int B,
+                                                       float * restrict sa0, float * restrict sa1,
+                                                       uint8_t * restrict act_rt, int pr) {
+    const float m0 = hmxi_absmax_row(x0, B * 32);
+    const float m1 = hmxi_absmax_row(x1, B * 32);
+    *sa0 = m0 > 0.0f ? m0 / 32767.0f : 0.0f;
+    *sa1 = m1 > 0.0f ? m1 / 32767.0f : 0.0f;
+    union { float f; int32_t i; } i0 = { m0 > 0.0f ? 32767.0f / m0 : 0.0f }, i1 = { m1 > 0.0f ? 32767.0f / m1 : 0.0f };
+    const HVX_Vector v0 = Q6_V_vsplat_R(i0.i), v1 = Q6_V_vsplat_R(i1.i);
+    const HVX_Vector qlo = Q6_V_vsplat_R(-32767), qhi = Q6_V_vsplat_R(32767), qoff = Q6_V_vsplat_R(32768);
+    int b = 0;
+    for (; b + 2 <= B; b += 2) {
+        const HVX_Vector a0 = *(const HVX_UVector *) (x0 + b * 32);
+        const HVX_Vector a1 = *(const HVX_UVector *) (x1 + b * 32);
+        const HVX_Vector c0 = *(const HVX_UVector *) (x0 + b * 32 + 32);
+        const HVX_Vector c1 = *(const HVX_UVector *) (x1 + b * 32 + 32);
+        HVX_Vector qa0 = HMXI_QCONV(a0, v0), qa1 = HMXI_QCONV(a1, v1), qc0 = HMXI_QCONV(c0, v0), qc1 = HMXI_QCONV(c1, v1);
+        qa0 = HMXI_QCLAMP(qa0); qa1 = HMXI_QCLAMP(qa1); qc0 = HMXI_QCLAMP(qc0); qc1 = HMXI_QCLAMP(qc1);
+        *(HVX_Vector *) (act_rt + (size_t) b * 2048 + pr * 128)       = Q6_Vh_vshuff_Vh(Q6_Vh_vpacke_VwVw(qa1, qa0));
+        *(HVX_Vector *) (act_rt + (size_t) (b + 1) * 2048 + pr * 128) = Q6_Vh_vshuff_Vh(Q6_Vh_vpacke_VwVw(qc1, qc0));
+    }
+    for (; b < B; b++) {
+        const HVX_Vector qa0 = HMXI_QCLAMP(HMXI_QCONV(*(const HVX_UVector *) (x0 + b * 32), v0));
+        const HVX_Vector qa1 = HMXI_QCLAMP(HMXI_QCONV(*(const HVX_UVector *) (x1 + b * 32), v1));
+        *(HVX_Vector *) (act_rt + (size_t) b * 2048 + pr * 128) = Q6_Vh_vshuff_Vh(Q6_Vh_vpacke_VwVw(qa1, qa0));
+    }
+}
+#undef HMXI_QCONV
+#undef HMXI_QCLAMP
+
 // one row pair (pr = 0..15 inside row tile at act_rt), all B blocks
 static void __attribute__((noinline)) hmxi_quant_pair(const float * x0, const float * x1, int B, float * sa0, float * sa1,
                                                       uint8_t * act_rt, int pr) {
+    if (x0 && x1 && sa1) {
+        hmxi_quant_pair2(x0, x1, B, sa0, sa1, act_rt, pr);
+        return;
+    }
     const float m0 = x0 ? hmxi_absmax_row(x0, B * 32) : 0.0f;
     const float m1 = x1 ? hmxi_absmax_row(x1, B * 32) : 0.0f;
     *sa0 = m0 > 0.0f ? m0 / 32767.0f : 0.0f;
@@ -109,7 +162,8 @@ static void __attribute__((noinline)) hmxi_quant_pair(const float * x0, const fl
 // Every other tile is only 64-byte aligned in DDR: unaligned loads; the scale load starts at byte 448
 // so nothing past the tile is read.
 
-static void __attribute__((noinline)) hmxi_cvt_tile(const uint8_t * src, HVX_Vector * wt, HVX_Vector * cv, HVX_Vector * dv) {
+static inline __attribute__((always_inline)) void hmxi_cvt_body(const uint8_t * restrict src, HVX_Vector * restrict wt,
+                                                                HVX_Vector * restrict cv, HVX_Vector * restrict dv) {
     const HVX_Vector k0f  = Q6_V_vsplat_R(0x0f0f0f0f);
     const HVX_Vector k08  = Q6_V_vsplat_R(0x08080808);
     HVX_Vector       sumq = Q6_V_vzero();
@@ -142,13 +196,38 @@ static void __attribute__((noinline)) hmxi_cvt_tile(const uint8_t * src, HVX_Vec
     *dv = Q6_V_vor_VV(r, sign);
 }
 
-// a whole column tile (B blocks) plus mid = 128 * sum_b d_b = 0.5 * sum_b dv_b
+static void __attribute__((noinline)) hmxi_cvt_tile(const uint8_t * src, HVX_Vector * wt, HVX_Vector * cv, HVX_Vector * dv) {
+    hmxi_cvt_body(src, wt, cv, dv);
+}
+
+// Two tiles in one call. On its own a tile runs 53 packets in 168 cycles - mostly waiting on the unaligned loads and
+// the shuffle / vrmpy latencies; with two independent tiles scheduled together the stalls of one are filled with the
+// other's work. Outputs are disjoint (restrict holds) and bit-identical to two hmxi_cvt_tile calls.
+// hexagon-sim: 168 -> 117 cycles per tile (-30.4%), 2.04 -> 2.89 ops per packet.
+static void __attribute__((noinline)) hmxi_cvt_tile2(const uint8_t * restrict s0, const uint8_t * restrict s1,
+                                                     HVX_Vector * restrict w0, HVX_Vector * restrict c0, HVX_Vector * restrict d0,
+                                                     HVX_Vector * restrict w1, HVX_Vector * restrict c1, HVX_Vector * restrict d1) {
+    hmxi_cvt_body(s0, w0, c0, d0);
+    hmxi_cvt_body(s1, w1, c1, d1);
+}
+
+// tiles b0 .. b1-1 of one column tile, two at a time
+static inline void hmxi_cvt_run(const uint8_t * src, int b0, int b1, uint8_t * wt, HVX_Vector * cv, HVX_Vector * dv) {
+    int b = b0;
+    for (; b + 2 <= b1; b += 2)
+        hmxi_cvt_tile2(src + (size_t) b * 576, src + (size_t) (b + 1) * 576,
+                       (HVX_Vector *) (wt + (size_t) b * 1024), cv + b, dv + b,
+                       (HVX_Vector *) (wt + (size_t) (b + 1) * 1024), cv + b + 1, dv + b + 1);
+    if (b < b1) hmxi_cvt_tile(src + (size_t) b * 576, (HVX_Vector *) (wt + (size_t) b * 1024), cv + b, dv + b);
+}
+
+// a whole column tile (B blocks) plus mid = 128 * sum_b d_b = 0.5 * sum_b dv_b.
+// Converts two tiles at a time first, then sums dv in the original b order: the qf32 additions happen in the same
+// order as before, so mid is bit-identical.
 static void __attribute__((noinline)) hmxi_cvt_coltile(const uint8_t * src, int B, uint8_t * wt, HVX_Vector * cv, HVX_Vector * dv, HVX_Vector * mid) {
+    hmxi_cvt_run(src, 0, B, wt, cv, dv);
     HVX_Vector acc = Q6_V_vzero();
-    for (int b = 0; b < B; b++) {
-        hmxi_cvt_tile(src + (size_t) b * 576, (HVX_Vector *) (wt + (size_t) b * 1024), cv + b, dv + b);
-        acc = Q6_Vqf32_vadd_Vqf32Vsf(acc, dv[b]);
-    }
+    for (int b = 0; b < B; b++) acc = Q6_Vqf32_vadd_Vqf32Vsf(acc, dv[b]);
     *mid = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(acc), Q6_V_vsplat_R(0x3f000000)));
 }
 

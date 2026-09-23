@@ -127,8 +127,8 @@ static void hmxi_job_cvt_k(unsigned int n, unsigned int i, void * data) {
         const int c = t / nkr, b0 = (t % nkr) * HMXI_CVT_KRUN;
         const int b1 = B - b0 < HMXI_CVT_KRUN ? B : b0 + HMXI_CVT_KRUN;
         const uint8_t * src = j->weight + (size_t) (j->ct0 + c) * B * 576;
-        for (int b = b0; b < b1; b++)
-            hmxi_cvt_tile(src + (size_t) b * 576, (HVX_Vector *) (j->wt + ((size_t) c * B + b) * 1024), j->cv + c * B + b, j->dv + c * B + b);
+        // two tiles at a time (hmxi_cvt_run); same outputs as one hmxi_cvt_tile per b
+        hmxi_cvt_run(src, b0, b1, j->wt + (size_t) c * B * 1024, j->cv + c * B, j->dv + c * B);
     }
 }
 
