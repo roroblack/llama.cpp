@@ -121,6 +121,8 @@ static int    opt_fa_qf32   = 1; // 1 = v73 HVX flash-attn keeps QK and PV accum
 static int    opt_fa_skipmask = 1; // 1 = HVX flash-attn skips K/V blocks the mask hides completely (causal future,
                                  // (default on since 2026-09-24; it also fixed the 3 long-standing kv=16384 FA failures),
                                  // outside the sliding window). Their contribution is exactly zero. GGML_HEXAGON_FA_SKIPMASK.
+static int    opt_fa_group  = 0; // G > 1: HVX flash-attn does G consecutive tokens of one head per K/V DMA
+                                 // (needs SKIPMASK; GGML_HEXAGON_FA_GROUP, up to 8)
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
 static int    opt_async_status = 0; // 1 = graph_compute returns before its batches finish (old behaviour)
 static int    opt_batch_deadline_s = 60; // a DSP batch unanswered this long ends the process (Codex q33a)
@@ -3698,6 +3700,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     kparams->qrows_per_thread = (kparams->qrows + sess->n_threads - 1) / sess->n_threads;
     kparams->pv_regacc = (opt_fa_pvreg && (DV % 256) == 0) ? 1 : 0;
     kparams->fa_flags  = (opt_fa_qf32 ? HTP_FA_FLAG_QF32 : 0) | (opt_fa_skipmask ? HTP_FA_FLAG_SKIPMASK : 0);
+    kparams->fa_group  = (uint8_t) (opt_fa_group < 0 ? 0 : (opt_fa_group > 8 ? 8 : opt_fa_group));
 
     return true;
 }
@@ -6811,6 +6814,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_pvreg  = getenv("GGML_HEXAGON_FA_PVREG");
     const char * str_fa_qf32   = getenv("GGML_HEXAGON_FA_QF32");
     const char * str_fa_skipm  = getenv("GGML_HEXAGON_FA_SKIPMASK");
+    const char * str_fa_group  = getenv("GGML_HEXAGON_FA_GROUP");
     const char * str_mm_int    = getenv("GGML_HEXAGON_INT_HMX");
     const char * str_mm_int_minrows = getenv("GGML_HEXAGON_INT_HMX_MINROWS");
     const char * str_mm_int_nc = getenv("GGML_HEXAGON_INT_HMX_NC");
@@ -6869,6 +6873,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_pvreg  = str_fa_pvreg  ? atoi(str_fa_pvreg)                    : opt_fa_pvreg;
     opt_fa_qf32   = str_fa_qf32   ? atoi(str_fa_qf32)                     : opt_fa_qf32;
     opt_fa_skipmask = str_fa_skipm ? atoi(str_fa_skipm)                   : opt_fa_skipmask;
+    opt_fa_group  = str_fa_group  ? atoi(str_fa_group)                    : opt_fa_group;
     if (const char * s = getenv("GGML_HEXAGON_ASYNC_STATUS")) { opt_async_status = atoi(s); }
     if (const char * s = getenv("GGML_HEXAGON_BATCH_DEADLINE_S")) { opt_batch_deadline_s = std::max(1, atoi(s)); }
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_FI")) {

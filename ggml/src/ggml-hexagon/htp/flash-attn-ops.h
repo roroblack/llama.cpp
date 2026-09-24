@@ -83,6 +83,7 @@ struct htp_fa_kernel_params {
 
     uint8_t  pv_regacc;          // HVX: PV accumulator kept in registers per K/V block (bit-identical), appended
     uint8_t  fa_flags;           // HVX: HTP_FA_FLAG_* (appended)
+    uint8_t  fa_group;           // HVX: rows per shared K/V DMA (GGML_HEXAGON_FA_GROUP, 0/1 = off, appended)
 };
 
 #define HTP_FA_FLAG_QF32     0x1 // accumulate QK / PV in qf32 on < v79 and convert once (not bit-identical)
