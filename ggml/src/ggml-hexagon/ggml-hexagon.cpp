@@ -121,8 +121,10 @@ static int    opt_fa_qf32   = 1; // 1 = v73 HVX flash-attn keeps QK and PV accum
 static int    opt_fa_skipmask = 1; // 1 = HVX flash-attn skips K/V blocks the mask hides completely (causal future,
                                  // (default on since 2026-09-24; it also fixed the 3 long-standing kv=16384 FA failures),
                                  // outside the sliding window). Their contribution is exactly zero. GGML_HEXAGON_FA_SKIPMASK.
-static int    opt_fa_group  = 0; // G > 1: HVX flash-attn does G consecutive tokens of one head per K/V DMA
-                                 // (needs SKIPMASK; GGML_HEXAGON_FA_GROUP, up to 8)
+static int    opt_fa_group  = 8; // G > 1: HVX flash-attn does G consecutive tokens of one head per K/V DMA
+                                 // (needs SKIPMASK; GGML_HEXAGON_FA_GROUP, up to 8, 0 = off). Default 8 since
+                                 // 2026-09-25: alternating on device pp512 106-117 -> 132, pp2048 82-89 -> 108,
+                                 // FLASH_ATTN_EXT 2465/2465, perplexity identical to the per-row SKIPMASK path.
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
 static int    opt_async_status = 0; // 1 = graph_compute returns before its batches finish (old behaviour)
 static int    opt_batch_deadline_s = 60; // a DSP batch unanswered this long ends the process (Codex q33a)
