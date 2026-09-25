@@ -126,6 +126,7 @@ static int    opt_fa_group  = 8; // G > 1: HVX flash-attn does G consecutive tok
                                  // 2026-09-25: alternating on device pp512 106-117 -> 132, pp2048 82-89 -> 108,
                                  // FLASH_ATTN_EXT 2465/2465, perplexity identical to the per-row SKIPMASK path.
 static int    opt_mm_int_hfcomb = 0; // integer HMX consumers combine through fp16 (GGML_HEXAGON_INT_HMX_HFCOMB, not exact)
+static int    opt_mm_int_ilv    = 0; // integer HMX producer interleaves consumers per K segment (GGML_HEXAGON_INT_HMX_ILV, exact)
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
 static int    opt_async_status = 0; // 1 = graph_compute returns before its batches finish (old behaviour)
 static int    opt_batch_deadline_s = 60; // a DSP batch unanswered this long ends the process (Codex q33a)
@@ -4163,7 +4164,7 @@ static bool ggml_hexagon_precompute_int_hmx_mm_params(
     kparams->n_chunk     = L.nct;
     kparams->vtcm_size   = (int) sess->vtcm_size;
     kparams->pipeline    = opt_mm_int_fi;    // unused by this kernel otherwise: fault injection (0 = off)
-    kparams->n_prefetch  = opt_mm_int_hfcomb; // unused by this kernel otherwise: fp16 combine (0 = exact path)
+    kparams->n_prefetch  = (opt_mm_int_hfcomb ? 1 : 0) | (opt_mm_int_ilv ? 2 : 0); // unused by this kernel otherwise
 
     static bool announced = false;
     if (!announced) {
@@ -6820,6 +6821,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_skipm  = getenv("GGML_HEXAGON_FA_SKIPMASK");
     const char * str_fa_group  = getenv("GGML_HEXAGON_FA_GROUP");
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_HFCOMB")) { opt_mm_int_hfcomb = atoi(s); }
+    if (const char * s = getenv("GGML_HEXAGON_INT_HMX_ILV"))    { opt_mm_int_ilv    = atoi(s); }
     const char * str_mm_int    = getenv("GGML_HEXAGON_INT_HMX");
     const char * str_mm_int_minrows = getenv("GGML_HEXAGON_INT_HMX_MINROWS");
     const char * str_mm_int_nc = getenv("GGML_HEXAGON_INT_HMX_NC");

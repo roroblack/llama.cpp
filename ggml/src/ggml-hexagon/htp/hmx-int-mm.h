@@ -47,6 +47,7 @@ struct hmxi_job {
     atomic_int                 abort;
     atomic_int                 why;      // HMXI_WHY_*: what raised abort
     int                        hfcomb;   // GGML_HEXAGON_INT_HMX_HFCOMB: consumers use hmxi_combine_hf
+    int                        ilv;      // GGML_HEXAGON_INT_HMX_ILV: producer interleaves consumers per segment
     int                        fi_lock;  // fault injection armed for this group (producer side)
     int                        fi_cancel;
     int                        fi_stall_ready, fi_stall_freed, fi_stall_worker, fi_stall_main;
@@ -140,11 +141,48 @@ static void hmxi_mid_from_dv(const HVX_Vector * dv, int B, HVX_Vector * mid) {
     *mid = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(acc), Q6_V_vsplat_R(0x3f000000)));
 }
 
+// One segment of unit u for consumer w = u % nc. Returns 1 on abort.
+static inline int hmxi_produce_one(struct hmxi_job * j, int u, int sg) {
+    const int B = j->L.B, nc = j->L.nc, nseg = j->L.nseg, seg = j->L.seg;
+    const int w = u % nc, jw = u / nc, c = u / j->n_rt, rt = u % j->n_rt;
+    const int s = jw * nseg + sg, slot = s % HMXI_DEPTH;
+    if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return 1;
+    {
+        unsigned spins = 0; unsigned long long t0 = 0;
+        while ((int) atomic_load_explicit(&j->freed[w].v, memory_order_acquire) + HMXI_DEPTH <= s) {
+            if (hmxi_wait_tick(j, &spins, &t0)) return 1;
+        }
+    }
+    const int b0 = sg * seg, nb = B - b0 < seg ? B - b0 : seg;
+    hmxi_blocks(j->at + ((size_t) rt * B + b0) * 2048, j->wt + ((size_t) c * B + b0) * 1024,
+                j->ring + ((size_t) w * HMXI_DEPTH + slot) * seg * 2048, j->rec, nb);
+    atomic_store_explicit(&j->ready[w].v, (unsigned) (s + 1), memory_order_release);
+    return 0;
+}
+
 static void hmxi_job_produce(void * data) {
     struct hmxi_job * j = (struct hmxi_job *) data;
     if (!j->hq->hmx_locked) { atomic_store(&j->why, HMXI_WHY_LOCK); atomic_store(&j->abort, 1); return; }
     const int B = j->L.B, nc = j->L.nc, nseg = j->L.nseg, seg = j->L.seg;
     const int U = j->nct * j->n_rt;
+    // GGML_HEXAGON_INT_HMX_ILV: the loop below makes every segment of one unit back to back for ONE consumer, and
+    // with HMXI_DEPTH = 2 the producer stops after two until that consumer frees a slot - the other consumers
+    // sit idle meanwhile. With several K segments (large K) the device showed both sides waiting: K=12288 x
+    // N=1536, producer busy 21% / waiting 75%, consumers busy 34% / waiting 56% (diag build 2026-09-25). Walking
+    // segment by segment across the consumers of a round keeps them all fed. Each consumer still receives its
+    // units and segments in the same order, so the results are identical. Fault-injection hooks stay on the
+    // original loop only.
+    if (j->ilv && !j->fi_stall_ready && !j->fi_cancel) {
+        const int R = (U + nc - 1) / nc;
+        for (int jw = 0; jw < R; jw++)
+            for (int sg = 0; sg < nseg; sg++)
+                for (int w = 0; w < nc; w++) {
+                    const int u = jw * nc + w;
+                    if (u >= U) break;
+                    if (hmxi_produce_one(j, u, sg)) return;
+                }
+        return;
+    }
     for (int u = 0; u < U; u++) {
         const int w = u % nc, jw = u / nc, c = u / j->n_rt, rt = u % j->n_rt;
         for (int sg = 0; sg < nseg; sg++) {
@@ -258,7 +296,8 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     J.dv   = (HVX_Vector *) (vtcm + J.L.off_dv);
     J.mid  = (HVX_Vector *) (vtcm + J.L.off_mid);
     J.act = act; J.act_stride = act_stride; J.weight = weight;
-    J.hfcomb = hfcomb;
+    J.hfcomb = hfcomb & 1;
+    J.ilv    = (hfcomb >> 1) & 1;
     J.dst = dst; J.dst_stride = dst_stride; J.dst_cols = dst_cols;
     hmxi_init_record((uint32_t *) J.rec);
 
