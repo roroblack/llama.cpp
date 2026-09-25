@@ -257,6 +257,36 @@ static void __attribute__((noinline)) hmxi_combine(const uint8_t * st0, const HV
     for (int i = 0; i < 16; i++) acc_out[2 * p0 + i] = Q6_Vsf_equals_Vqf32(a[i]);
 }
 
+// fp16 variant (GGML_HEXAGON_INT_HMX_HFCOMB): QT goes to fp16 64 lanes at a time and is multiplied by 256*d as fp16
+// into a qf32 pair, instead of sign-extend -> 2 int->float conversions -> 2 fp32 multiplies. On v73 the float ops
+// (conversion, qf32 multiply, qf32 add) issue at about one every two cycles, so their count is the cost: 7 -> 4
+// per 64 values. hexagon-sim, one 32x32 tile per block: 239 -> 149 cycles. NOT exact: |QT| > 2048 loses mantissa
+// bits in fp16 (per-block partial sum relative error up to ~2^-11; sim: max 3.6e-4 of the largest accumulator).
+// 256*d is exact in fp16 (d is fp16). The vmpy pair splits even/odd halfword lanes exactly as vsxt does, so the
+// accumulator layout is the same as hmxi_combine's.
+static void __attribute__((noinline)) hmxi_combine_hf(const uint8_t * st0, const HVX_Vector * cv, const HVX_Vector * dv,
+                                                      HVX_Vector * acc_out, int p0, int nb, int accumulate) {
+    HVX_Vector a[16];
+    const HVX_Vector zero = Q6_V_vzero();
+#pragma unroll
+    for (int i = 0; i < 16; i++) a[i] = accumulate ? Q6_Vqf32_vadd_VsfVsf(acc_out[2 * p0 + i], zero) : zero;
+    for (int b = 0; b < nb; b++) {
+        const HVX_Vector * st   = (const HVX_Vector *) (st0 + (size_t) b * 2048) + p0;
+        const HVX_Vector   cvec = cv[b];
+        // [d0, d0, d1, d1, ...]: the interleaving fp32 -> fp16 conversion of dv with itself
+        const HVX_Vector   q    = Q6_Vqf32_vadd_VsfVsf(dv[b], zero);
+        const HVX_Vector   dh   = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q, q));
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            HVX_VectorPair p = Q6_Wqf32_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_Vh_vsub_VhVh(st[k], cvec)), dh);
+            a[2 * k]     = Q6_Vqf32_vadd_Vqf32Vqf32(a[2 * k], Q6_V_lo_W(p));
+            a[2 * k + 1] = Q6_Vqf32_vadd_Vqf32Vqf32(a[2 * k + 1], Q6_V_hi_W(p));
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 16; i++) acc_out[2 * p0 + i] = Q6_Vsf_equals_Vqf32(a[i]);
+}
+
 // y = s_a * (acc + mid) for rows < rows, columns < cols, into dst (row stride in floats)
 static void __attribute__((noinline)) hmxi_epilogue(const HVX_Vector * acc, HVX_Vector mid, const float * sa, float * dst,
                                                     int dst_stride, int rows, int cols) {

@@ -46,6 +46,7 @@ struct hmxi_job {
     struct hmxi_seq            ready[HMXI_MAXW], freed[HMXI_MAXW];
     atomic_int                 abort;
     atomic_int                 why;      // HMXI_WHY_*: what raised abort
+    int                        hfcomb;   // GGML_HEXAGON_INT_HMX_HFCOMB: consumers use hmxi_combine_hf
     int                        fi_lock;  // fault injection armed for this group (producer side)
     int                        fi_cancel;
     int                        fi_stall_ready, fi_stall_freed, fi_stall_worker, fi_stall_main;
@@ -197,8 +198,13 @@ static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
             if (atomic_load_explicit(&j->abort, memory_order_relaxed)) return;
             const int b0 = sg * seg, nb = B - b0 < seg ? B - b0 : seg;
             const uint8_t * src = j->ring + ((size_t) w * HMXI_DEPTH + slot) * seg * 2048;
-            hmxi_combine(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 0, nb, sg > 0);
-            hmxi_combine(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 8, nb, sg > 0);
+            if (j->hfcomb) {
+                hmxi_combine_hf(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 0, nb, sg > 0);
+                hmxi_combine_hf(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 8, nb, sg > 0);
+            } else {
+                hmxi_combine(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 0, nb, sg > 0);
+                hmxi_combine(src, j->cv + c * B + b0, j->dv + c * B + b0, acc, 8, nb, sg > 0);
+            }
             if (j->fi_stall_freed && w == 0) {  // fault injection: never release; only the producer's deadline ends it
                 while (!atomic_load_explicit(&j->abort, memory_order_relaxed)) hex_pause();
                 return;
@@ -217,7 +223,7 @@ static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
 // W = host-repacked Q4_0 with n (padded to 32) output rows. Returns 0 on success.
 static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_stride, int dst_cols,
                                const float * act, int act_stride, const uint8_t * weight,
-                               int m, int k, int n, int n_threads, int vtcm_size, int seg_cap, int fi) {
+                               int m, int k, int n, int n_threads, int vtcm_size, int seg_cap, int fi, int hfcomb) {
     if (!ctx->hmx_queue || !ctx->work_queue) return -2;
     size_t V = (size_t) vtcm_size;
     if (V == 0 || V > ctx->vtcm_size) V = ctx->vtcm_size;
@@ -252,6 +258,7 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     J.dv   = (HVX_Vector *) (vtcm + J.L.off_dv);
     J.mid  = (HVX_Vector *) (vtcm + J.L.off_mid);
     J.act = act; J.act_stride = act_stride; J.weight = weight;
+    J.hfcomb = hfcomb;
     J.dst = dst; J.dst_stride = dst_stride; J.dst_cols = dst_cols;
     hmxi_init_record((uint32_t *) J.rec);
 

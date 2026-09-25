@@ -3393,7 +3393,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
                                   (const float *) src1->data, act_stride, (const uint8_t *) src0->data,
                                   m_total, k, n, n_threads, kparams->vtcm_size,
                                   0                   /* K segment: default (HMXI_SEG) */,
-                                  kparams->pipeline   /* integer path: fault injection HMXI_FI_*, 0 = off */);
+                                  kparams->pipeline   /* integer path: fault injection HMXI_FI_*, 0 = off */,
+                                  kparams->n_prefetch /* integer path: 1 = fp16 combine (GGML_HEXAGON_INT_HMX_HFCOMB) */);
     } else if (kparams->kernel_type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
         hmx_mm_f16_f32_batched_params_t batch_params = {
             .dst             = (float *) dst->data,
