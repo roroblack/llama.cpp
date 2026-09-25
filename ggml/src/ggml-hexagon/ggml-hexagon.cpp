@@ -125,8 +125,11 @@ static int    opt_fa_group  = 8; // G > 1: HVX flash-attn does G consecutive tok
                                  // (needs SKIPMASK; GGML_HEXAGON_FA_GROUP, up to 8, 0 = off). Default 8 since
                                  // 2026-09-25: alternating on device pp512 106-117 -> 132, pp2048 82-89 -> 108,
                                  // FLASH_ATTN_EXT 2465/2465, perplexity identical to the per-row SKIPMASK path.
-static int    opt_mm_int_hfcomb = 0; // integer HMX consumers combine through fp16 (GGML_HEXAGON_INT_HMX_HFCOMB, not exact)
-static int    opt_mm_int_ilv    = 0; // integer HMX producer interleaves consumers per K segment (GGML_HEXAGON_INT_HMX_ILV, exact)
+static int    opt_mm_int_hfcomb = 1; // integer HMX consumers combine through fp16 (GGML_HEXAGON_INT_HMX_HFCOMB=0: exact path)
+                                     // default on since 2026-09-25: device alternating pp512 127-129 -> 144-147,
+                                     // MUL_MAT 570/570, perplexity 12.7457 -> 12.7442 (CPU reference 12.7648)
+static int    opt_mm_int_ilv    = 1; // integer HMX producer interleaves consumers per K segment (GGML_HEXAGON_INT_HMX_ILV, exact)
+                                     // default on since 2026-09-25: pp512 +5~12%, pp2048 +3~9%, results identical
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
 static int    opt_async_status = 0; // 1 = graph_compute returns before its batches finish (old behaviour)
 static int    opt_batch_deadline_s = 60; // a DSP batch unanswered this long ends the process (Codex q33a)
