@@ -128,6 +128,7 @@ static int    opt_fa_group  = 8; // G > 1: HVX flash-attn does G consecutive tok
 static int    opt_mm_int_hfcomb = 1; // integer HMX consumers combine through fp16 (GGML_HEXAGON_INT_HMX_HFCOMB=0: exact path)
                                      // default on since 2026-09-25: device alternating pp512 127-129 -> 144-147,
                                      // MUL_MAT 570/570, perplexity 12.7457 -> 12.7442 (CPU reference 12.7648)
+static int    opt_mm_int_ovl    = 0; // integer HMX: next group's weight conversion overlaps the pipe (GGML_HEXAGON_INT_HMX_OVL, exact)
 static int    opt_mm_int_ilv    = 1; // integer HMX producer interleaves consumers per K segment (GGML_HEXAGON_INT_HMX_ILV, exact)
                                      // default on since 2026-09-25: pp512 +5~12%, pp2048 +3~9%, results identical
 static int    opt_mm_int_fi = 0; // integer HMX fault injection (GGML_HEXAGON_INT_HMX_FI, test only; HMXI_FI_*)
@@ -4167,7 +4168,7 @@ static bool ggml_hexagon_precompute_int_hmx_mm_params(
     kparams->n_chunk     = L.nct;
     kparams->vtcm_size   = (int) sess->vtcm_size;
     kparams->pipeline    = opt_mm_int_fi;    // unused by this kernel otherwise: fault injection (0 = off)
-    kparams->n_prefetch  = (opt_mm_int_hfcomb ? 1 : 0) | (opt_mm_int_ilv ? 2 : 0); // unused by this kernel otherwise
+    kparams->n_prefetch  = (opt_mm_int_hfcomb ? 1 : 0) | (opt_mm_int_ilv ? 2 : 0) | (opt_mm_int_ovl ? 4 : 0); // unused by this kernel otherwise
 
     static bool announced = false;
     if (!announced) {
@@ -6825,6 +6826,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_group  = getenv("GGML_HEXAGON_FA_GROUP");
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_HFCOMB")) { opt_mm_int_hfcomb = atoi(s); }
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_ILV"))    { opt_mm_int_ilv    = atoi(s); }
+    if (const char * s = getenv("GGML_HEXAGON_INT_HMX_OVL"))    { opt_mm_int_ovl    = atoi(s); }
     const char * str_mm_int    = getenv("GGML_HEXAGON_INT_HMX");
     const char * str_mm_int_minrows = getenv("GGML_HEXAGON_INT_HMX_MINROWS");
     const char * str_mm_int_nc = getenv("GGML_HEXAGON_INT_HMX_NC");

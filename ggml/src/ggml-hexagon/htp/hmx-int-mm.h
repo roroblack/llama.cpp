@@ -48,6 +48,12 @@ struct hmxi_job {
     atomic_int                 why;      // HMXI_WHY_*: what raised abort
     int                        hfcomb;   // GGML_HEXAGON_INT_HMX_HFCOMB: consumers use hmxi_combine_hf
     int                        ilv;      // GGML_HEXAGON_INT_HMX_ILV: producer interleaves consumers per segment
+    // GGML_HEXAGON_INT_HMX_OVL: the next column group's weight tiles, converted by the consumers during this pipe
+    uint8_t *                  nwt;
+    HVX_Vector *               ncv;
+    HVX_Vector *               ndv;
+    int                        nx_ct0, nx_nct, nx_tasks;
+    atomic_int                 nx_next;
     int                        fi_lock;  // fault injection armed for this group (producer side)
     int                        fi_cancel;
     int                        fi_stall_ready, fi_stall_freed, fi_stall_worker, fi_stall_main;
@@ -211,6 +217,19 @@ static void hmxi_job_produce(void * data) {
     }
 }
 
+// One (column tile, run of K blocks) conversion task of the next group, taken by whichever consumer gets there.
+// Same tiles as hmxi_job_cvt_k writes, so the next group's pipe reads identical inputs.
+static inline int hmxi_cvt_steal(struct hmxi_job * j) {
+    if (j->nx_tasks <= 0) return 0;
+    const int t = atomic_fetch_add_explicit(&j->nx_next, 1, memory_order_relaxed);
+    if (t >= j->nx_tasks) return 0;
+    const int B = j->L.B, nkr = (B + HMXI_CVT_KRUN - 1) / HMXI_CVT_KRUN;
+    const int c = t / nkr, b0 = (t % nkr) * HMXI_CVT_KRUN;
+    const int b1 = B - b0 < HMXI_CVT_KRUN ? B : b0 + HMXI_CVT_KRUN;
+    hmxi_cvt_run(j->weight + (size_t) (j->nx_ct0 + c) * B * 576, b0, b1, j->nwt + (size_t) c * B * 1024, j->ncv + c * B, j->ndv + c * B);
+    return 1;
+}
+
 static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
     struct hmxi_job * j = (struct hmxi_job *) data;
     (void) n;
@@ -254,7 +273,9 @@ static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
         const int col0 = (j->ct0 + c) * 32, cols = j->dst_cols - col0 < 32 ? j->dst_cols - col0 : 32;
         if (rows > 0 && cols > 0)
             hmxi_epilogue(acc, j->mid[c], j->sa + rt * 32, j->dst + (size_t) (j->m0 + rt * 32) * j->dst_stride + col0, j->dst_stride, rows, cols);
+        hmxi_cvt_steal(j);  // one conversion task of the next group per finished unit (no-op without OVL)
     }
+    while (hmxi_cvt_steal(j)) ;
 }
 
 // dst[m][dst_cols] (row stride dst_stride floats) = act[m][k] (row stride act_stride) x W^T,
@@ -298,11 +319,21 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     J.act = act; J.act_stride = act_stride; J.weight = weight;
     J.hfcomb = hfcomb & 1;
     J.ilv    = (hfcomb >> 1) & 1;
+    J.nx_tasks = 0;
     J.dst = dst; J.dst_stride = dst_stride; J.dst_cols = dst_cols;
     hmxi_init_record((uint32_t *) J.rec);
 
     const int n_ct_all = (n + 31) / 32;
     unsigned long long tA = 0, tW = 0, tP = 0, t0;
+    // GGML_HEXAGON_INT_HMX_OVL: the weight conversion stage ran between pipes with the HMX idle (device, fp16 combine
+    // and ILV on: conversion 22-24% of the matmul, HMX 78-91% busy inside the pipe). Split the weight area into two
+    // halves; while one half's group goes through the pipe, the consumers convert the next group into the other
+    // half between their units. Tiles and accumulation order are unchanged, so results are identical.
+    const int ovl = ((hfcomb >> 2) & 1) && fi == 0 && J.L.nct >= 2;
+    const int gstep = ovl ? J.L.nct / 2 : J.L.nct;
+    uint8_t * const    wt0 = J.wt;
+    HVX_Vector * const cv0 = J.cv, * const dv0 = J.dv, * const mid0 = J.mid;
+    const size_t hB = (size_t) gstep * J.L.B;
     for (int m0 = 0; m0 < m; m0 += J.L.mc) {
         J.m0 = m0; J.mr = m - m0 < J.L.mc ? m - m0 : J.L.mc; J.n_rt = (J.mr + 31) / 32;
         t0 = HAP_perf_get_pcycles();
@@ -312,10 +343,22 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
             if (r) return r;
         }
         tA += HAP_perf_get_pcycles() - t0;
-        for (int ct0 = 0; ct0 < n_ct_all; ct0 += J.L.nct) {
-            J.ct0 = ct0; J.nct = n_ct_all - ct0 < J.L.nct ? n_ct_all - ct0 : J.L.nct;
+        for (int ct0 = 0, g = 0; ct0 < n_ct_all; ct0 += gstep, g++) {
+            J.ct0 = ct0; J.nct = n_ct_all - ct0 < gstep ? n_ct_all - ct0 : gstep;
+            const int buf = ovl ? (g & 1) : 0;
+            J.wt = wt0 + (size_t) buf * hB * 1024; J.cv = cv0 + buf * hB; J.dv = dv0 + buf * hB; J.mid = mid0 + buf * gstep;
+            J.nx_tasks = 0;
+            if (ovl && ct0 + gstep < n_ct_all) {
+                J.nwt = wt0 + (size_t) (buf ^ 1) * hB * 1024; J.ncv = cv0 + (buf ^ 1) * hB; J.ndv = dv0 + (buf ^ 1) * hB;
+                J.nx_ct0 = ct0 + gstep;
+                J.nx_nct = n_ct_all - J.nx_ct0 < gstep ? n_ct_all - J.nx_ct0 : gstep;
+                J.nx_tasks = J.nx_nct * ((J.L.B + HMXI_CVT_KRUN - 1) / HMXI_CVT_KRUN);
+                atomic_store(&J.nx_next, 0);
+            }
             t0 = HAP_perf_get_pcycles();
-            if (J.nct < (int) ctx->n_threads) {
+            if (ovl && g > 0) {
+                // converted during the previous pipe; only the per-column mid is left
+            } else if (J.nct < (int) ctx->n_threads) {
                 const int r = hmxi_fi_take(ctx, fi, HMXI_FI_CVT_K, "cvt_k") ? -8 : hmxi_wq(ctx, hmxi_job_cvt_k, &J, ctx->n_threads, -8);
                 if (r) return r;
                 for (int c = 0; c < J.nct; c++) hmxi_mid_from_dv(J.dv + c * J.L.B, J.L.B, J.mid + c);
@@ -360,6 +403,10 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
             if (crc != 0) {
                 FARF(ERROR, "int-hmx: consumer launch failed; producer aborted and drained");
                 return -9;
+            }
+            if (ovl && J.nx_tasks > 0) {
+                while (hmxi_cvt_steal(&J)) ;   // normally nothing is left
+                for (int c = 0; c < J.nx_nct; c++) hmxi_mid_from_dv(J.ndv + c * J.L.B, J.L.B, mid0 + (g & 1 ? 0 : gstep) + c);
             }
             tP += HAP_perf_get_pcycles() - t0;
             if (atomic_load(&J.abort)) {
