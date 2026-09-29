@@ -89,6 +89,7 @@ struct htp_fa_kernel_params {
 #define HTP_FA_FLAG_QF32     0x1 // accumulate QK / PV in qf32 on < v79 and convert once (not bit-identical)
 #define HTP_FA_FLAG_SKIPMASK 0x2 // skip K/V blocks the mask hides completely
 #define HTP_FA_FLAG_QK8      0x4 // grouped path: QK in int8, one scale per 32 dims on both sides (not bit-identical)
+#define HTP_FA_FLAG_HMXK     0x10 // prefill (>= 16 rows): QK and PV on integer HMX over the whole KV (hmxk-fa.h), falls back when it does not fit
 #define HTP_FA_FLAG_PV8      0x8 // grouped path: PV in int8, V one scale per dim and block, P one per row and block
 
 #if defined(__cplusplus)

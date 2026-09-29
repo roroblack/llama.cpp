@@ -134,6 +134,7 @@ static int    opt_fa_group  = 8; // G > 1: HVX flash-attn does G consecutive tok
                                  // FLASH_ATTN_EXT 2465/2465, perplexity identical to the per-row SKIPMASK path.
 static int    opt_fa_qk8    = 0; // 1 = grouped HVX flash-attn does QK in int8 with one scale per 32 dims on Q and K
                                  // (GGML_HEXAGON_FA_QK8, opt-in: CPU perplexity with the same math 12.7648 -> 12.7932)
+static int    opt_fa_hmxk   = 0; // 1 = flash-attn prefill (>= 16 rows) runs QK and PV on integer HMX (hmxk-fa.h, imported), opt-in
 static int    opt_fa_pv8    = 0; // 1 = grouped HVX flash-attn does PV in int8: V one scale per dim over the block's keys,
                                  // P one scale per row and block (GGML_HEXAGON_FA_PV8, opt-in; sim output rel. rms 1-3%)
 static int    opt_mm_int_hfcomb = 1; // integer HMX consumers combine through fp16 (GGML_HEXAGON_INT_HMX_HFCOMB=0: exact path)
@@ -3911,7 +3912,8 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     kparams->qrows_per_thread = (kparams->qrows + sess->n_threads - 1) / sess->n_threads;
     kparams->pv_regacc = (opt_fa_pvreg && (DV % 256) == 0) ? 1 : 0;
     kparams->fa_flags  = (opt_fa_qf32 ? HTP_FA_FLAG_QF32 : 0) | (opt_fa_skipmask ? HTP_FA_FLAG_SKIPMASK : 0) |
-                         (opt_fa_qk8 ? HTP_FA_FLAG_QK8 : 0) | (opt_fa_pv8 ? HTP_FA_FLAG_PV8 : 0);
+                         (opt_fa_qk8 ? HTP_FA_FLAG_QK8 : 0) | (opt_fa_pv8 ? HTP_FA_FLAG_PV8 : 0) |
+                         (opt_fa_hmxk ? HTP_FA_FLAG_HMXK : 0);
     kparams->fa_group  = (uint8_t) (opt_fa_group < 0 ? 0 : (opt_fa_group > 8 ? 8 : opt_fa_group));
 
     return true;
@@ -7033,6 +7035,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_OVL"))    { opt_mm_int_ovl    = atoi(s); }
     if (const char * s = getenv("GGML_HEXAGON_FA_QK8"))         { opt_fa_qk8        = atoi(s); }
     if (const char * s = getenv("GGML_HEXAGON_FA_PV8"))         { opt_fa_pv8        = atoi(s); }
+    if (const char * s = getenv("GGML_HEXAGON_FA_HMXK"))        { opt_fa_hmxk       = atoi(s); }
     const char * str_mm_int    = getenv("GGML_HEXAGON_INT_HMX");
     const char * str_mm_int_minrows = getenv("GGML_HEXAGON_INT_HMX_MINROWS");
     const char * str_mm_int_nc = getenv("GGML_HEXAGON_INT_HMX_NC");
