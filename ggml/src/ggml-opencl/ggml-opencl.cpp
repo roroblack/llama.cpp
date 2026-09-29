@@ -8764,6 +8764,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             if (adreno_e17_compiler_quirks(backend_ctx)) {
                 return false;
             }
+            // GGML_OPENCL_NO_FLASH_ATTN=1: report no FA support, so that flash_attn "auto" resolves to off while the KV
+            // cache keeps the layout it was made with (V not transposed - the one a Hexagon server uses, needed for
+            // slot hand-over). On Adreno 825 the FA kernels made a llama-server 1.4k-token request 156 vs 192 t/s
+            // prompt and 10 vs 14 t/s decode (SM8735, 2026-09-29); "-fa off" would transpose V instead.
+            static const bool no_fa = [] { const char * e = getenv("GGML_OPENCL_NO_FLASH_ATTN"); return e && atoi(e) != 0; }();
+            if (no_fa) {
+                return false;
+            }
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];
             const ggml_tensor * v = op->src[2];
