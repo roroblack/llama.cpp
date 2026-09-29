@@ -13,12 +13,28 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
+#include <thread>
+#include <atomic>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
+#endif
 
 //
 // llama_context
@@ -2730,6 +2746,308 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// Sequence state files that name K/V rows instead of holding them (a GPU server hands a prompt to an NPU server).
+// LLAMA_STATE_SHARED_KV=1 in the saving process: rows of tensors in a dma-buf that other processes can map (ggml-opencl
+// with GGML_OPENCL_SHARE_SOCK, proc "ggml_backend_tensor_dmabuf_ref") are written as (buffer id, offset) - the file is
+// then a few KiB. LLAMA_STATE_SHARED_KV_SOCK=<GGML_OPENCL_SHARE_SOCK>.kv in the loading process: where it gets the fds
+// of those buffers; the load copies each range from its own mapping straight into its KV cache. Every tensor range is
+// a record: u32 tag, then (tag 1) u64 id, u64 offset, u64 size or (tag 0) u64 size + the bytes. Such a file is valid only
+// until the saving process rewrites those cells (the relay keeps its GPU lock until the restore is done).
+#define LLAMA_STATE_SEQ_VERSION_REF (LLAMA_STATE_SEQ_VERSION | 0x10000u)
+
+static bool llama_state_shared_kv() {
+    static const bool on = [] { const char * e = getenv("LLAMA_STATE_SHARED_KV"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+typedef bool (*llama_tensor_dmabuf_ref_t)(const ggml_tensor *, size_t, size_t, uint64_t *, uint64_t *);
+
+class llama_io_write_file_ref : public llama_io_write_file {
+public:
+    using llama_io_write_file::llama_io_write_file;
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        const uint64_t sz = size;
+        uint64_t id = 0, off = 0;
+        llama_tensor_dmabuf_ref_t fn = lookup(tensor);
+        if (fn && fn(tensor, offset, size, &id, &off)) {
+            const uint32_t tag = 1;
+            write(&tag, sizeof(tag));
+            write(&id, sizeof(id));
+            write(&off, sizeof(off));
+            write(&sz, sizeof(sz));
+            return;
+        }
+        const uint32_t tag = 0;
+        write(&tag, sizeof(tag));
+        write(&sz, sizeof(sz));
+        llama_io_write_file::write_tensor(tensor, offset, size);
+    }
+
+private:
+    static llama_tensor_dmabuf_ref_t lookup(const ggml_tensor * t) {
+        ggml_backend_buffer_t b = t->view_src ? t->view_src->buffer : t->buffer;
+        if (!b) {
+            return nullptr;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b));
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        return reg ? (llama_tensor_dmabuf_ref_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_tensor_dmabuf_ref") : nullptr;
+    }
+};
+
+// the other process's KV buffers, mapped read-only; fetched again from the socket when an id is unknown (that
+// process restarted), dropping buffers it no longer offers
+struct llama_kv_peer {
+#if defined(__linux__)
+    struct buf { int fd; void * ptr; size_t size; };
+    std::mutex                        mtx;
+    std::unordered_map<uint64_t, buf> bufs;
+
+    void refresh(const char * path) {
+        int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_un a = {};
+        a.sun_family = AF_UNIX;
+        strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
+        if (s < 0 || connect(s, (sockaddr *) &a, sizeof(a)) < 0) {
+            LLAMA_LOG_WARN("%s: cannot connect to %s\n", __func__, path);
+            if (s >= 0) close(s);
+            return;
+        }
+        uint64_t len = 0;
+        iovec iov = { &len, sizeof(len) };
+        char cbuf[CMSG_SPACE(sizeof(int) * 64)] = {};
+        msghdr m = {};
+        m.msg_iov        = &iov;
+        m.msg_iovlen     = 1;
+        m.msg_control    = cbuf;
+        m.msg_controllen = sizeof(cbuf);
+        std::vector<int> fds;
+        if (recvmsg(s, &m, MSG_CMSG_CLOEXEC) == (ssize_t) sizeof(len)) {
+            for (cmsghdr * cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm)) {
+                if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+                    const size_t n = (cm->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                    fds.resize(n);
+                    memcpy(fds.data(), CMSG_DATA(cm), n * sizeof(int));
+                }
+            }
+        }
+        std::string text(len < (1u << 20) ? len : 0, '\0');
+        size_t got = 0;
+        while (got < text.size()) {
+            ssize_t r = read(s, &text[got], text.size() - got);
+            if (r <= 0) break;
+            got += (size_t) r;
+        }
+        close(s);
+        std::vector<bool> used(fds.size(), false);
+        std::unordered_map<uint64_t, buf> keep;
+        std::istringstream in(text.substr(0, got));
+        size_t fi = 0, size = 0;
+        uint64_t id = 0;
+        while (in >> fi >> id >> size) {
+            if (fi >= fds.size() || used[fi]) continue;
+            auto it = bufs.find(id);
+            if (it != bufs.end()) {
+                keep[id] = it->second;
+                bufs.erase(it);
+                continue;
+            }
+            void * p = mmap(nullptr, size, PROT_READ, MAP_SHARED, fds[fi], 0);
+            if (p == MAP_FAILED) {
+                LLAMA_LOG_WARN("%s: cannot map KV buffer %" PRIx64 " (%zu bytes): %s\n", __func__, id, size, strerror(errno));
+                continue;
+            }
+            keep[id] = { fds[fi], p, size };
+            used[fi] = true;
+        }
+        for (size_t i = 0; i < fds.size(); i++) {
+            if (!used[i]) close(fds[i]);
+        }
+        for (auto & kv : bufs) {
+            munmap(kv.second.ptr, kv.second.size);
+            close(kv.second.fd);
+        }
+        bufs.swap(keep);
+        LLAMA_LOG_INFO("%s: %zu KV buffers from %s (%zu fds received)\n", __func__, bufs.size(), path, fds.size());
+    }
+
+    // DMA_BUF_IOCTL_SYNC brackets the CPU reads of one load; it maintains the caches of the WHOLE buffer, so it runs once
+    // per buffer and load (per tensor range it made a restore 71.5 ms instead of 12.4 ms, 2026-09-29).
+    // LLAMA_STATE_SHARED_KV_NOSYNC=1 leaves it out: ggml-opencl makes these buffers io-coherent, so GPU writes reach the
+    // CPU caches. 8 prompts x 2 passes rewriting the same cells gave 16/16 answers equal to the file hand-over with and
+    // without the sync, restore median 22.9 ms with it and 11 ms without (file 15.0; SM8735, 2026-09-29).
+    // (DMA_BUF_IOCTL_SYNC_PARTIAL of older Android kernels answers ENOTTY on the phone's 6.6 android15 kernel.)
+    static bool nosync() {
+        static const bool off = [] { const char * e = getenv("LLAMA_STATE_SHARED_KV_NOSYNC"); return e && atoi(e) != 0; }();
+        return off;
+    }
+
+    static void dmabuf_sync(int fd, bool end) {
+        if (nosync()) {
+            return;
+        }
+        struct { uint64_t flags; } req = { end ? (uint64_t) (1 | 4) : (uint64_t) 1 };  // DMA_BUF_SYNC_READ (| DMA_BUF_SYNC_END)
+        ioctl(fd, _IOW('b', 0, uint64_t), &req);                                         // DMA_BUF_IOCTL_SYNC
+    }
+
+    // where [off, off + size) of buffer id is mapped here, nullptr when that memory is not available; the cache sync of
+    // its buffer is begun (started: fds begun in this load, the caller ends them after its copies)
+    const uint8_t * src(uint64_t id, uint64_t off, uint64_t size, std::vector<int> & started) {
+        const char * path = getenv("LLAMA_STATE_SHARED_KV_SOCK");
+        if (!path || !*path) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        if (bufs.find(id) == bufs.end()) {
+            refresh(path);
+        }
+        auto it = bufs.find(id);
+        if (it == bufs.end() || off + size > it->second.size) {
+            return nullptr;
+        }
+        if (std::find(started.begin(), started.end(), it->second.fd) == started.end()) {
+            dmabuf_sync(it->second.fd, false);
+            started.push_back(it->second.fd);
+        }
+        return (const uint8_t *) it->second.ptr + off;
+    }
+#else
+    static void dmabuf_sync(int, bool) {}
+    const uint8_t * src(uint64_t, uint64_t, uint64_t, std::vector<int> &) { return nullptr; }
+#endif
+};
+
+static llama_kv_peer & llama_kv_peer_get() {
+    static llama_kv_peer p;
+    return p;
+}
+
+class llama_io_read_file_ref : public llama_io_read_file {
+public:
+    using llama_io_read_file::llama_io_read_file;
+
+    // The copies run when the load is done (before the syncs end). LLAMA_STATE_SHARED_KV_THREADS=n cuts them in 256 KiB
+    // pieces over n threads for buffers where set_tensor is a plain copy (host buffers, Hexagon "HTP" buffers). Default 1:
+    // 1/4/8 threads gave the same restore time (cold median 32.4/33.1/32.3 ms and 25.2/33.2/37.6 ms, two rounds, 1,379
+    // tokens, SM8735 2026-09-29) - the copy is not what the restore waits for.
+    ~llama_io_read_file_ref() {
+        try {
+            run_copies();
+        } catch (...) {  // a destructor must not throw (it also runs while a failed load unwinds)
+        }
+        for (int fd : started) {
+            llama_kv_peer::dmabuf_sync(fd, true);
+        }
+    }
+
+    // The writer made one record per range of cells in ITS cache and the reader asks per range of cells in THIS cache;
+    // when the two caches place the sequence differently the ranges differ (09-29 relay: every third hand-over failed
+    // with "tensor record size 1423360 != 1421312"). Records are therefore consumed as a byte stream, as a plain state
+    // file is: a request may take the rest of one record and the start of the next. Per layer the totals agree.
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        while (size > 0) {
+            if (cur_left == 0) {
+                next_record(tensor);
+            }
+            const size_t n = (size_t) std::min<uint64_t>(cur_left, size);
+            if (cur_src) {
+                copies.push_back({ tensor, cur_src, offset, n });
+                cur_src += n;
+            } else {
+                temp.resize(n);
+                read(temp.data(), n);
+                ggml_backend_tensor_set(tensor, temp.data(), offset, n);
+            }
+            cur_left -= n;
+            offset   += n;
+            size     -= n;
+        }
+    }
+
+private:
+    // reads the next record header: tag 0 = inline bytes follow, tag 1 = (buffer id, offset) in the saving process
+    void next_record(const ggml_tensor * tensor) {
+        uint32_t tag = 0;
+        uint64_t sz  = 0;
+        read(&tag, sizeof(tag));
+        if (tag == 0) {
+            read(&sz, sizeof(sz));
+            cur_src = nullptr;
+        } else if (tag == 1) {
+            uint64_t id = 0, off = 0;
+            read(&id, sizeof(id));
+            read(&off, sizeof(off));
+            read(&sz, sizeof(sz));
+            cur_src = llama_kv_peer_get().src(id, off, sz, started);
+            if (!cur_src) {
+                LLAMA_LOG_ERROR("%s: shared KV buffer %" PRIx64 " [%" PRIu64 ", +%" PRIu64 ") is not available (tensor %s)\n", __func__, id, off, sz,
+                                tensor->name);
+                throw std::runtime_error(format("sequence state: shared KV buffer %" PRIx64 " is not available", id));
+            }
+        } else {
+            LLAMA_LOG_ERROR("%s: unknown tensor record tag %u (tensor %s)\n", __func__, tag, tensor->name);
+            throw std::runtime_error("sequence state: unknown tensor record");
+        }
+        if (sz == 0) {
+            LLAMA_LOG_ERROR("%s: empty tensor record (tensor %s)\n", __func__, tensor->name);
+            throw std::runtime_error("sequence state: empty tensor record");
+        }
+        cur_left = sz;
+    }
+
+    const uint8_t *      cur_src  = nullptr;  // tag 1: where the rest of the current record is mapped
+    uint64_t             cur_left = 0;        // bytes left in the current record
+    std::vector<uint8_t> temp;
+
+    struct job { ggml_tensor * tensor; const uint8_t * src; size_t offset; size_t size; };
+
+    static bool plain_copy(const ggml_tensor * t) {
+        ggml_backend_buffer_t b = t->view_src ? t->view_src->buffer : t->buffer;
+        if (!b) {
+            return false;
+        }
+        ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(b);
+        return ggml_backend_buft_is_host(bt) || strncmp(ggml_backend_buft_name(bt), "HTP", 3) == 0;
+    }
+
+    void run_copies() {
+        static const int n_thr = [] { const char * e = getenv("LLAMA_STATE_SHARED_KV_THREADS"); const int n = e ? atoi(e) : 1; return n < 1 ? 1 : (n > 16 ? 16 : n); }();
+        const size_t piece = 256 * 1024;
+        std::vector<job> pieces;
+        for (const auto & c : copies) {
+            if (n_thr == 1 || !plain_copy(c.tensor)) {
+                ggml_backend_tensor_set(c.tensor, c.src, c.offset, c.size);
+                continue;
+            }
+            for (size_t o = 0; o < c.size; o += piece) {
+                pieces.push_back({ c.tensor, c.src + o, c.offset + o, std::min(piece, c.size - o) });
+            }
+        }
+        copies.clear();
+        if (pieces.empty()) {
+            return;
+        }
+        std::atomic<size_t> next{0};
+        auto work = [&]() {
+            for (size_t i; (i = next.fetch_add(1)) < pieces.size();) {
+                ggml_backend_tensor_set(pieces[i].tensor, pieces[i].src, pieces[i].offset, pieces[i].size);
+            }
+        };
+        std::vector<std::thread> thr;
+        for (int t = 1; t < n_thr && (size_t) t < pieces.size(); t++) {
+            thr.emplace_back(work);
+        }
+        work();
+        for (auto & t : thr) {
+            t.join();
+        }
+    }
+
+    std::vector<int> started;
+    std::vector<job> copies;
+};
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -3197,16 +3515,18 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
+    bool ref = false;
 
     // version checks
     {
         const uint32_t magic   = file.read_u32();
         const uint32_t version = file.read_u32();
 
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+        if (magic != LLAMA_STATE_SEQ_MAGIC || (version != LLAMA_STATE_SEQ_VERSION && version != LLAMA_STATE_SEQ_VERSION_REF)) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
             return 0;
         }
+        ref = version == LLAMA_STATE_SEQ_VERSION_REF;
     }
 
     // load the prompt
@@ -3236,8 +3556,14 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
-        const size_t nread = state_seq_read_data(io, seq_id, 0);
+        size_t nread = 0;
+        if (ref) {
+            llama_io_read_file_ref io(&file);
+            nread = state_seq_read_data(io, seq_id, 0);
+        } else {
+            llama_io_read_file io(&file);
+            nread = state_seq_read_data(io, seq_id, 0);
+        }
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;
@@ -3252,19 +3578,29 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
 
+    const bool ref = llama_state_shared_kv();
+
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
+    file.write_u32(ref ? LLAMA_STATE_SEQ_VERSION_REF : LLAMA_STATE_SEQ_VERSION);
 
     // save the prompt
     file.write_u32((uint32_t) n_token_count);
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
     // save the context state using stream saving
-    llama_io_write_file io(&file);
-    state_seq_write_data(io, seq_id, 0);
+    size_t n = 0;
+    if (ref) {
+        llama_io_write_file_ref io(&file);
+        state_seq_write_data(io, seq_id, 0);
+        n = io.n_bytes();
+    } else {
+        llama_io_write_file io(&file);
+        state_seq_write_data(io, seq_id, 0);
+        n = io.n_bytes();
+    }
 
     const size_t res = file.tell();
-    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
+    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + n);
 
     return res;
 }
