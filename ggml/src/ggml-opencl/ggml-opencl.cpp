@@ -32,6 +32,18 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 );
 
 #include <CL/cl.h>
+#include <CL/cl_ext.h>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <errno.h>
+#include <thread>
+#endif
 
 #include <inttypes.h>
 #include <string.h>
@@ -8924,6 +8936,241 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
 //
 // buffer
 //
+// GGML_OPENCL_DMABUF=1: device buffers live in a dma-buf from /dev/dma_heap/system, imported with cl_qcom_ion_host_ptr.
+// First step towards one copy of the weights shared with the Hexagon backend in another process. On Adreno 825 a kernel
+// reads such a buffer as fast as a plain one (256 MB: 50.4 GB/s plain, 51.2 iocoherent, scripts/cl_dmabuf_probe.c).
+struct ggml_cl_dmabuf {
+    int    fd   = -1;
+    void * ptr  = nullptr;
+    size_t size = 0;
+
+    ~ggml_cl_dmabuf() {
+#if defined(__linux__)
+        if (ptr) munmap(ptr, size);
+        if (fd >= 0) close(fd);
+#endif
+    }
+};
+
+static const char * ggml_cl_share_sock();
+
+static bool ggml_cl_use_dmabuf() {
+    static const bool on = [] { const char * e = getenv("GGML_OPENCL_DMABUF"); return (e && atoi(e) != 0) || ggml_cl_share_sock(); }();
+    return on;
+}
+
+// returns nullptr (and leaves d empty) when the heap, the mapping or the import is not available
+static cl_mem ggml_cl_alloc_dmabuf(cl_context context, size_t size, ggml_cl_dmabuf & d) {
+#if defined(__linux__) && defined(CL_MEM_ION_HOST_PTR_QCOM)
+    struct dma_heap_allocation_data { uint64_t len; uint32_t fd, fd_flags; uint64_t heap_flags; };
+    static int heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+    if (heap < 0) return nullptr;
+    const size_t len = (size + 4095) & ~(size_t) 4095;
+    dma_heap_allocation_data a = { len, 0, O_RDWR | O_CLOEXEC, 0 };
+    if (ioctl(heap, _IOWR('H', 0x0, dma_heap_allocation_data), &a) < 0) return nullptr;
+    void * ptr = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, (int) a.fd, 0);
+    if (ptr == MAP_FAILED) { close((int) a.fd); return nullptr; }
+    cl_mem_ion_host_ptr ion = {};
+    ion.ext_host_ptr.allocation_type   = CL_MEM_ION_HOST_PTR_QCOM;
+    ion.ext_host_ptr.host_cache_policy = CL_MEM_HOST_IOCOHERENT_QCOM;
+    ion.ion_filedesc = (int) a.fd;
+    ion.ion_hostptr  = ptr;
+    cl_int err;
+    cl_mem mem = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM, size, &ion, &err);
+    if (err != CL_SUCCESS) { munmap(ptr, len); close((int) a.fd); return nullptr; }
+    d.fd = (int) a.fd; d.ptr = ptr; d.size = len;
+    return mem;
+#else
+    GGML_UNUSED(context); GGML_UNUSED(size); GGML_UNUSED(d);
+    return nullptr;
+#endif
+}
+
+// GGML_OPENCL_SHARE_SOCK=<path> (turns on GGML_OPENCL_DMABUF): a client on that unix socket gets the dma-buf fds of the
+// device buffers (SCM_RIGHTS) and one line per Q4_0 weight - where its scales (d) and quants (q) sit and in which layout -
+// so that the Hexagon backend in another process can use this copy of the weights instead of its own.
+// Line: "<fd index> <name> <ne0> <ne1> <ne2> <d offset> <q offset> <layout>"; layout 1 = quants unshuffled and both q and d
+// transposed as 16-bit words (use_adreno_kernels), 0 = anything else.
+struct ggml_cl_share_entry {
+    std::string name;
+    int64_t     ne0, ne1, ne2;
+    int         fd;
+    size_t      d_off, q_off;
+    int         layout;
+};
+static std::mutex                       g_cl_share_mtx;
+static std::vector<ggml_cl_share_entry> g_cl_share;
+
+static const char * ggml_cl_share_sock() {
+    static const char * p = getenv("GGML_OPENCL_SHARE_SOCK");
+    return p && *p ? p : nullptr;
+}
+
+#if defined(__linux__)
+static void ggml_cl_share_serve(std::string path) {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) { GGML_LOG_WARN("ggml_opencl: share socket: %s\n", strerror(errno)); return; }
+    sockaddr_un a = {};
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, path.c_str(), sizeof(a.sun_path) - 1);
+    unlink(path.c_str());
+    if (bind(s, (sockaddr *) &a, sizeof(a)) < 0 || listen(s, 4) < 0) {
+        GGML_LOG_WARN("ggml_opencl: share socket %s: %s\n", path.c_str(), strerror(errno));
+        close(s);
+        return;
+    }
+    GGML_LOG_INFO("ggml_opencl: sharing Q4_0 weights on %s\n", path.c_str());
+    for (;;) {
+        int c = accept4(s, nullptr, nullptr, SOCK_CLOEXEC);
+        if (c < 0) continue;
+        std::string text;
+        std::vector<int> fds;
+        {
+            std::lock_guard<std::mutex> lock(g_cl_share_mtx);
+            for (const auto & e : g_cl_share) {
+                int fi = -1;
+                for (size_t i = 0; i < fds.size(); i++) if (fds[i] == e.fd) fi = (int) i;
+                if (fi < 0) { fi = (int) fds.size(); fds.push_back(e.fd); }
+                char line[512];
+                snprintf(line, sizeof(line), "%d %s %" PRId64 " %" PRId64 " %" PRId64 " %zu %zu %d\n", fi, e.name.c_str(), e.ne0, e.ne1, e.ne2,
+                         e.d_off, e.q_off, e.layout);
+                text += line;
+            }
+        }
+        // first message: text length, with the fds attached; then the text
+        uint64_t len = text.size();
+        iovec iov = { &len, sizeof(len) };
+        char cbuf[CMSG_SPACE(sizeof(int) * 64)] = {};
+        msghdr m = {};
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        if (!fds.empty() && fds.size() <= 64) {
+            m.msg_control = cbuf;
+            m.msg_controllen = CMSG_SPACE(sizeof(int) * fds.size());
+            cmsghdr * cm = CMSG_FIRSTHDR(&m);
+            cm->cmsg_level = SOL_SOCKET;
+            cm->cmsg_type  = SCM_RIGHTS;
+            cm->cmsg_len   = CMSG_LEN(sizeof(int) * fds.size());
+            memcpy(CMSG_DATA(cm), fds.data(), sizeof(int) * fds.size());
+        }
+        if (sendmsg(c, &m, 0) == (ssize_t) sizeof(len)) {
+            size_t done = 0;
+            while (done < text.size()) {
+                ssize_t n = write(c, text.data() + done, text.size() - done);
+                if (n <= 0) break;
+                done += (size_t) n;
+            }
+        }
+        close(c);
+    }
+}
+#endif
+
+static void ggml_cl_share_add(ggml_cl_share_entry e) {
+#if defined(__linux__)
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(ggml_cl_share_serve, std::string(ggml_cl_share_sock())).detach(); });
+    std::lock_guard<std::mutex> lock(g_cl_share_mtx);
+    g_cl_share.push_back(std::move(e));
+#else
+    GGML_UNUSED(e);
+#endif
+}
+
+// KV-cache hand-over without a copy: with GGML_OPENCL_SHARE_SOCK=<path>, <path>.kv offers the other dma-buf buffers of
+// this process (not weights, not compute: the KV cache) - fds by SCM_RIGHTS as above, then one line per buffer
+// "<fd index> <id> <size>". A saved sequence state can then name its K/V rows as (id, offset)
+// (ggml_backend_opencl_tensor_dmabuf_ref, used by llama_state_seq_save_file with LLAMA_STATE_SHARED_KV=1) and the
+// loading process copies them from its own mapping of the same memory. Ids carry the pid, so a restarted server's
+// buffers never match an old reference.
+struct ggml_cl_kvbuf {
+    uint64_t              id;
+    int                   fd;
+    size_t                size;
+    ggml_backend_buffer_t buf;
+};
+static std::vector<ggml_cl_kvbuf> g_cl_kvbufs;  // guarded by g_cl_share_mtx
+
+#if defined(__linux__)
+static void ggml_cl_kv_serve(std::string path) {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) { GGML_LOG_WARN("ggml_opencl: kv socket: %s\n", strerror(errno)); return; }
+    sockaddr_un a = {};
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, path.c_str(), sizeof(a.sun_path) - 1);
+    unlink(path.c_str());
+    if (bind(s, (sockaddr *) &a, sizeof(a)) < 0 || listen(s, 4) < 0) {
+        GGML_LOG_WARN("ggml_opencl: kv socket %s: %s\n", path.c_str(), strerror(errno));
+        close(s);
+        return;
+    }
+    GGML_LOG_INFO("ggml_opencl: offering KV-cache buffers on %s\n", path.c_str());
+    for (;;) {
+        int c = accept4(s, nullptr, nullptr, SOCK_CLOEXEC);
+        if (c < 0) continue;
+        std::string text;
+        std::vector<int> fds;
+        {
+            std::lock_guard<std::mutex> lock(g_cl_share_mtx);
+            for (const auto & b : g_cl_kvbufs) {
+                const ggml_backend_buffer_usage u = b.buf->usage;
+                if (u == GGML_BACKEND_BUFFER_USAGE_WEIGHTS || u == GGML_BACKEND_BUFFER_USAGE_COMPUTE || fds.size() >= 64) continue;
+                char line[128];
+                snprintf(line, sizeof(line), "%zu %" PRIu64 " %zu\n", fds.size(), b.id, b.size);
+                fds.push_back(b.fd);
+                text += line;
+            }
+        }
+        uint64_t len = text.size();
+        iovec iov = { &len, sizeof(len) };
+        char cbuf[CMSG_SPACE(sizeof(int) * 64)] = {};
+        msghdr m = {};
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        if (!fds.empty()) {
+            m.msg_control = cbuf;
+            m.msg_controllen = CMSG_SPACE(sizeof(int) * fds.size());
+            cmsghdr * cm = CMSG_FIRSTHDR(&m);
+            cm->cmsg_level = SOL_SOCKET;
+            cm->cmsg_type  = SCM_RIGHTS;
+            cm->cmsg_len   = CMSG_LEN(sizeof(int) * fds.size());
+            memcpy(CMSG_DATA(cm), fds.data(), sizeof(int) * fds.size());
+        }
+        if (sendmsg(c, &m, 0) == (ssize_t) sizeof(len)) {
+            size_t done = 0;
+            while (done < text.size()) {
+                ssize_t n = write(c, text.data() + done, text.size() - done);
+                if (n <= 0) break;
+                done += (size_t) n;
+            }
+        }
+        close(c);
+    }
+}
+#endif
+
+static uint64_t ggml_cl_kv_register(int fd, size_t size, ggml_backend_buffer_t buf) {
+#if defined(__linux__)
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(ggml_cl_kv_serve, std::string(ggml_cl_share_sock()) + ".kv").detach(); });
+    static uint64_t next = 0;
+    std::lock_guard<std::mutex> lock(g_cl_share_mtx);
+    const uint64_t id = ((uint64_t) getpid() << 24) | (++next & 0xffffff);
+    g_cl_kvbufs.push_back({ id, fd, size, buf });
+    return id;
+#else
+    GGML_UNUSED(fd); GGML_UNUSED(size); GGML_UNUSED(buf);
+    return 0;
+#endif
+}
+
+static void ggml_cl_kv_unregister(uint64_t id) {
+    std::lock_guard<std::mutex> lock(g_cl_share_mtx);
+    for (size_t i = 0; i < g_cl_kvbufs.size(); i++) {
+        if (g_cl_kvbufs[i].id == id) { g_cl_kvbufs.erase(g_cl_kvbufs.begin() + i); break; }
+    }
+}
+
 struct ggml_backend_opencl_buffer_context {
     // A buffer context can hold multiple cl_mem objects. This is for flattening
     // quantized weights and should be used with GGML_OPENCL_SMALL_ALLOC where
@@ -8935,7 +9182,13 @@ struct ggml_backend_opencl_buffer_context {
         buffer.push_back(buf);
     }
 
+    // backing dma-buf of buffer[0] with GGML_OPENCL_DMABUF; members are destroyed after the destructor body has
+    // released the cl_mem objects
+    ggml_cl_dmabuf dmabuf;
+    uint64_t       share_id = 0;  // ggml_cl_kv_register
+
     ~ggml_backend_opencl_buffer_context() {
+        if (share_id) ggml_cl_kv_unregister(share_id);
         for (cl_mem buf : buffer) {
             CL_CHECK(clReleaseMemObject(buf));
         }
@@ -9521,6 +9774,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             extra_orig->data_device, CL_MEM_READ_WRITE,
             CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         CL_CHECK(err);
+        const size_t d_origin = previous_origin;
+        const size_t q_origin = region.origin;
+        GGML_UNUSED(d_origin); GGML_UNUSED(q_origin);
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         // Adreno moe q4_0 kernel needs special transpose and unshuffling
@@ -9602,6 +9858,14 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, K/32, M);
         }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+        if (ggml_cl_share_sock() && ctx->dmabuf.fd >= 0 && extra_orig->data_device == ctx->buffer[0]) {
+            int layout = 0;
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+            layout = use_adreno_kernels(backend_ctx, tensor) ? 1 : 0;
+#endif
+            clFinish(queue);
+            ggml_cl_share_add({ tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], ctx->dmabuf.fd, d_origin, q_origin, layout });
+        }
         return;
     }
     if (tensor->type == GGML_TYPE_Q4_1) {
@@ -12241,8 +12505,15 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     // clCreateBuffer returns -61 for size 0
     size = std::max(size, (size_t)1);
 
-    cl_int err;
-    cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
+    cl_int err = CL_SUCCESS;
+    ggml_cl_dmabuf dmabuf;
+    cl_mem mem = ggml_cl_use_dmabuf() ? ggml_cl_alloc_dmabuf(backend_ctx->context, size, dmabuf) : nullptr;
+    if (ggml_cl_use_dmabuf() && !mem) {
+        GGML_LOG_WARN("%s: GGML_OPENCL_DMABUF: dma-buf allocation of %.2f MiB failed, using a plain buffer\n", __func__, size / 1024.0 / 1024.0);
+    }
+    if (!mem) {
+        mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
+    }
 #if GGML_OPENCL_TARGET_VERSION >= 300
     // clCreateBufferWithProperties and cl_mem_properties are OpenCL 3.0. Drivers older than
     // that do not export the symbol, so a build targeting them fails to link. The large
@@ -12260,8 +12531,15 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     }
 
     ggml_backend_opencl_buffer_context * ctx = new ggml_backend_opencl_buffer_context(mem);
+    std::swap(ctx->dmabuf.fd, dmabuf.fd);
+    std::swap(ctx->dmabuf.ptr, dmabuf.ptr);
+    std::swap(ctx->dmabuf.size, dmabuf.size);
 
-    return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
+    ggml_backend_buffer_t buf = ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
+    if (ggml_cl_share_sock() && ctx->dmabuf.fd >= 0) {
+        ctx->share_id = ggml_cl_kv_register(ctx->dmabuf.fd, ctx->dmabuf.size, buf);
+    }
+    return buf;
 }
 
 static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_type_t buffer_type) {
@@ -12459,11 +12737,49 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+// Where the rows [offset, offset + size) of t lie in a buffer offered on <GGML_OPENCL_SHARE_SOCK>.kv: *id and *off
+// (offset in that dma-buf). False when t is not in such a buffer or not stored as plain rows. The device queue is
+// finished first, so the memory holds what the last graph wrote.
+static bool ggml_backend_opencl_tensor_dmabuf_ref(const ggml_tensor * t, size_t offset, size_t size, uint64_t * id, uint64_t * off) {
+    ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+    if (!buffer || !buffer->buft || buffer->buft->iface.alloc_buffer != ggml_backend_opencl_buffer_type_alloc_buffer || !t->extra) {
+        return false;
+    }
+    if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    ggml_backend_opencl_buffer_context * ctx   = (ggml_backend_opencl_buffer_context *) buffer->context;
+    const ggml_tensor_extra_cl *         extra = (const ggml_tensor_extra_cl *) t->extra;
+    if (ctx->share_id == 0 || ctx->dmabuf.fd < 0 || extra->data_device != ctx->buffer[0]) {
+        return false;
+    }
+    const size_t o = extra->offset + t->view_offs + offset;
+    if (o + size > ctx->dmabuf.size) {
+        return false;
+    }
+    ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
+    ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
+    sync_with_other_backends(backend_ctx);
+    CL_CHECK(clFinish(backend_ctx->queue));
+    *id  = ctx->share_id;
+    *off = o;
+    return true;
+}
+
+static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_tensor_dmabuf_ref") == 0) {
+        return (void *) ggml_backend_opencl_tensor_dmabuf_ref;
+    }
+    return NULL;
+
+    GGML_UNUSED(reg);
+}
+
 static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
     /* .get_name         = */ ggml_backend_opencl_reg_get_name,
     /* .device_count     = */ ggml_backend_opencl_reg_device_count,
     /* .device_get       = */ ggml_backend_opencl_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_opencl_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_opencl_reg(void) {
