@@ -105,7 +105,10 @@ static int    opt_mm_int_hmx = 1;      // integer HMX Q4_0 matmul where the DSP'
                                         // sessions sharing the one DSP can hit the batch deadline, so run one session
                                         // per HTP; GGML_HEXAGON_INT_HMX=0 turns it off. These are parts whose fp16 HMX
                                         // does not compute, e.g. SM8735 / v73)
-static int    opt_mm_int_minrows = 32; // integer HMX only for MUL_MATs with at least this many rows
+static int    opt_mm_int_minrows = 10; // integer HMX only for MUL_MATs with at least this many rows (GGML_HEXAGON_INT_HMX_MINROWS)
+                                         // 32 until 2026-09-28; SM8735, t/s at 32 -> 2: pp8 29-32 -> 25, pp10 29.5 -> 31,
+                                         // pp12 30.4 -> 37, pp14 30.4 -> 42, pp16 31 -> 47, pp27 31 -> 73 (3 rounds each),
+                                         // tg unchanged, MUL_MAT 570/570 at 2
 static int    opt_mm_int_nc = 0;       // integer HMX consumer threads (0 = all HVX threads)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_pvreg  = 1; // 1 = HVX flash-attn PV keeps the f32 accumulator in registers per K/V block
