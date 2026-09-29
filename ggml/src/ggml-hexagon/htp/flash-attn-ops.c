@@ -51,6 +51,11 @@ struct htp_fa_context {
     size_t size_mask_row;  // grouped path: bytes per full mask row in VTCM
     size_t size_live;      // grouped path: per-thread live-block list + row bits
     uint8_t * spad_l;
+    bool qk8;              // HTP_FA_FLAG_QK8: grouped path does QK in int8 (hvx_fa_qk8_*)
+    bool pv8;              // HTP_FA_FLAG_PV8: grouped path does PV in int8 (hvx_fa_pv8_*)
+    size_t size_qk8;       // per-thread kq + ks (the query rows are in fa_qk8_qbuf)
+    size_t size_pv8;       // per-thread vq + sv
+    uint8_t * spad_x;      // per thread: the qk8 part, then the pv8 part
 
     struct fastdiv_values src0_div21;
     struct fastdiv_values src0_div1;
@@ -672,6 +677,13 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
 // for all G rows. Each row keeps its own M / S / accumulator and sees exactly the per-block work of the SKIPMASK
 // path, so results match it.
 #define FA_GRP_MAX 8
+// int8 QK / PV only for groups of at least this many rows: the K/V prep (~11800 cycles per block on SM8735) is paid once
+// per block and saves ~2830 per row, so a lone decode row would lose (long-context decode 15.2 -> 13.8 t/s, 2026-09-29)
+#define FA_INT8_MIN_ROWS 6
+
+// int8 QK: the query rows' int8 words, scales and corrections are read as scalars (vrmpy Rt); scalar loads from VTCM
+// made the dot 4079 cycles per row-block on the device against 517 in the sim, so they live in cached memory
+static uint8_t __attribute__((aligned(128))) fa_qk8_qbuf[HTP_MAX_NTHREADS][FA_GRP_MAX * HVX_FA_QK8_Q_BYTES(512)];
 
 static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, void * data) {
     struct htp_fa_context * factx = (struct htp_fa_context *) data;
@@ -714,6 +726,16 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
     uint16_t * live  = (uint16_t *) (factx->spad_l + factx->size_live * ith);
     uint8_t  * rbits = (uint8_t *) (live + factx->n_blocks);
 
+    const uint32_t DKq  = k->ne[0];
+    uint8_t    * xt   = factx->spad_x ? factx->spad_x + (factx->size_qk8 + factx->size_pv8) * ith : NULL;
+    uint8_t    * x8t  = factx->qk8 ? xt : NULL;
+    uint8_t    * vq8t = factx->pv8 ? xt + factx->size_qk8 : NULL;
+    uint8_t    * kq8  = x8t;
+    HVX_Vector * sv8  = vq8t ? (HVX_Vector *) (vq8t + HVX_FA_PV8_VQ_BYTES(v->ne[0])) : NULL;
+    HVX_Vector * ks8  = x8t ? (HVX_Vector *) (x8t + HVX_FA_QK8_KQ_BYTES(DKq)) : NULL;
+    // per query row: DK int8, DK/64 scale vectors, DK/128 correction vectors (HVX_FA_QK8_Q_BYTES)
+    uint8_t    * qx8  = x8t ? fa_qk8_qbuf[ith] : NULL;
+
     const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
     const HVX_Vector v_cap     = (factx->logit_softcap != 0.0f) ? hvx_vec_splat_f16(factx->logit_softcap) : Q6_V_vzero();
     const HVX_Vector vinf      = Q6_Vh_vsplat_R(0xFC00);
@@ -726,6 +748,8 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
         const uint32_t iq1 = (ir - iq3*neq2*neq1 - iq2 * neq1);
         // consecutive rows of the same head are consecutive tokens until iq1 wraps
         const uint32_t gn = MIN(MIN(G, ir1 - ir), neq1 - iq1);
+        uint8_t * const x8  = gn >= FA_INT8_MIN_ROWS ? x8t : NULL;
+        uint8_t * const vq8 = gn >= FA_INT8_MIN_ROWS ? vq8t : NULL;
 
         const uint32_t ik3 = fastdiv(iq3, &factx->broadcast_rk3);
         const uint32_t ik2 = fastdiv(iq2, &factx->broadcast_rk2);
@@ -747,6 +771,13 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
             for (uint32_t r = 0; r < gn; r++) {
                 uint8_t * qr = spad_q + r * factx->size_q_row_padded;
                 hvx_copy_f16_f32_aa(qr, qr, DK);
+            }
+        }
+        if (x8) {
+            for (uint32_t r = 0; r < gn; r++) {
+                uint8_t * qx = qx8 + r * HVX_FA_QK8_Q_BYTES(DK);
+                hvx_fa_qk8_qprep((const __fp16 *) (spad_q + r * factx->size_q_row_padded), DK, factx->scale, (int8_t *) qx,
+                                 (HVX_Vector *) (qx + DK), (HVX_Vector *) (qx + 3 * DK));
             }
         }
 
@@ -803,6 +834,13 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
 
             const HVX_VectorPred q_tail_keep = Q6_Q_vsetq2_R(bs * sizeof(__fp16));
             const uint8_t * k_hi = k_base + 32 * factx->size_k_row_padded;
+            if (x8) {
+                // keys past bs are stale VTCM; their lanes get their own scales and are masked below
+                hvx_fa_qk8_kprep(k_base, factx->size_k_row_padded, DK, kq8, ks8);
+            }
+            if (vq8) {
+                hvx_fa_pv8_vprep(v_base, factx->size_v_row_padded, bs, DV, vq8, sv8);
+            }
 
             for (uint32_t r = 0; r < gn; r++) {
                 if (!((rbits[ib] >> r) & 1)) continue;
@@ -811,7 +849,11 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
 
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_QK, ir + r);
                 HVX_Vector scores0, scores1;
-                if (factx->qf32) {
+                if (x8) {
+                    const uint8_t * qx = qx8 + r * HVX_FA_QK8_Q_BYTES(DK);
+                    hvx_fa_qk8_dot((const int8_t *) qx, (const float *) (qx + DK), (const int32_t *) (qx + 3 * DK), kq8, ks8, DK,
+                                   &scores0, &scores1);
+                } else if (factx->qf32) {
                     scores0 = hvx_dot_f16_f16_aa_rx32_qf(q_ptr, k_base, factx->size_k_row_padded, DK, factx->scale);
                     scores1 = (bs > 32) ? hvx_dot_f16_f16_aa_rx32_qf(q_ptr, k_hi, factx->size_k_row_padded, DK, factx->scale) : Q6_V_vzero();
                 } else {
@@ -859,6 +901,13 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
                 HVX_Vector v_s_minus_m_base2 = hvx_vec_mul_f16_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m), v_log2e);
                 HVX_Vector P = hvx_vec_exp2_f16(v_s_minus_m_base2);
                 P = Q6_V_vmux_QVV(q_tail_keep, P, Q6_V_vzero());
+
+                if (vq8) {
+                    const HVX_Vector p_sum_vec = hvx_fa_pv8_acc(VKQ32, vq8, sv8, P, DV);
+                    S_vec[r] = HVX_OP_ADD_F32(HVX_OP_MUL_F32(S_vec[r], ms_vec), p_sum_vec);
+                    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, ir + r);
+                    continue;
+                }
 
                 HVX_VectorPair P_pair = hvx_vec_f16_to_f32(P);
                 HVX_Vector p_sum_vec = hvx_vec_reduce_sum_f32(HVX_OP_ADD_F32(Q6_V_lo_W(P_pair), Q6_V_hi_W(P_pair)));
@@ -2700,6 +2749,13 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     factx.pv_regacc = kparams->pv_regacc != 0 && (v->ne[0] % 256) == 0;
     factx.qf32      = (kparams->fa_flags & HTP_FA_FLAG_QF32) != 0;
     factx.skipmask  = (kparams->fa_flags & HTP_FA_FLAG_SKIPMASK) != 0;
+    factx.qk8       = (kparams->fa_flags & HTP_FA_FLAG_QK8) != 0 && k->type == HTP_TYPE_F16 && (k->ne[0] % 128) == 0 &&
+                      k->ne[0] <= 512;
+    factx.pv8       = (kparams->fa_flags & HTP_FA_FLAG_PV8) != 0 && v->type == HTP_TYPE_F16 && (v->ne[0] % 64) == 0 &&
+                      v->ne[0] <= 512;
+    factx.spad_x    = NULL;
+    factx.size_qk8  = 0;
+    factx.size_pv8  = 0;
     factx.k = k;
     factx.v = v;
 
@@ -2771,6 +2827,20 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         factx.spad_m = vtcm_seq_alloc(&cur, factx.size_mask_row * G * octx->n_threads);
         factx.spad_a = vtcm_seq_alloc(&cur, size_vkq_acc * G * octx->n_threads);
         factx.spad_l = vtcm_seq_alloc(&cur, factx.size_live * octx->n_threads);
+        if (factx.qk8 || factx.pv8) {
+            const uint32_t DK = k->ne[0], DV = v->ne[0];
+            factx.size_qk8 = factx.qk8 ? HVX_FA_QK8_KQ_BYTES(DK) + HVX_FA_QK8_KS_BYTES(DK) : 0;
+            factx.size_pv8 = factx.pv8 ? HVX_FA_PV8_VQ_BYTES(DV) + HVX_FA_PV8_SV_BYTES(DV) : 0;
+            uint8_t * c2 = cur;
+            uint8_t * x  = vtcm_seq_alloc(&c2, (factx.size_qk8 + factx.size_pv8) * octx->n_threads);
+            if ((size_t) (c2 - octx->ctx->vtcm_base) <= octx->ctx->vtcm_size) {
+                factx.spad_x = x;
+                cur = c2;
+            } else {
+                factx.qk8 = factx.pv8 = false;  // does not fit: fp16 QK / PV
+                factx.size_qk8 = factx.size_pv8 = 0;
+            }
+        }
         if ((size_t) (cur - octx->ctx->vtcm_base) <= octx->ctx->vtcm_size) {
             if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
                 work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_thread_grp, &factx, octx->n_threads);

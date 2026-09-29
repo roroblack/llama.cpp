@@ -125,6 +125,10 @@ static int    opt_fa_group  = 8; // G > 1: HVX flash-attn does G consecutive tok
                                  // (needs SKIPMASK; GGML_HEXAGON_FA_GROUP, up to 8, 0 = off). Default 8 since
                                  // 2026-09-25: alternating on device pp512 106-117 -> 132, pp2048 82-89 -> 108,
                                  // FLASH_ATTN_EXT 2465/2465, perplexity identical to the per-row SKIPMASK path.
+static int    opt_fa_qk8    = 0; // 1 = grouped HVX flash-attn does QK in int8 with one scale per 32 dims on Q and K
+                                 // (GGML_HEXAGON_FA_QK8, opt-in: CPU perplexity with the same math 12.7648 -> 12.7932)
+static int    opt_fa_pv8    = 0; // 1 = grouped HVX flash-attn does PV in int8: V one scale per dim over the block's keys,
+                                 // P one scale per row and block (GGML_HEXAGON_FA_PV8, opt-in; sim output rel. rms 1-3%)
 static int    opt_mm_int_hfcomb = 1; // integer HMX consumers combine through fp16 (GGML_HEXAGON_INT_HMX_HFCOMB=0: exact path)
                                      // default on since 2026-09-25: device alternating pp512 127-129 -> 144-147,
                                      // MUL_MAT 570/570, perplexity 12.7457 -> 12.7442 (CPU reference 12.7648)
@@ -3707,7 +3711,8 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     kparams->qrows = q->ne[1] * q->ne[2] * q->ne[3];
     kparams->qrows_per_thread = (kparams->qrows + sess->n_threads - 1) / sess->n_threads;
     kparams->pv_regacc = (opt_fa_pvreg && (DV % 256) == 0) ? 1 : 0;
-    kparams->fa_flags  = (opt_fa_qf32 ? HTP_FA_FLAG_QF32 : 0) | (opt_fa_skipmask ? HTP_FA_FLAG_SKIPMASK : 0);
+    kparams->fa_flags  = (opt_fa_qf32 ? HTP_FA_FLAG_QF32 : 0) | (opt_fa_skipmask ? HTP_FA_FLAG_SKIPMASK : 0) |
+                         (opt_fa_qk8 ? HTP_FA_FLAG_QK8 : 0) | (opt_fa_pv8 ? HTP_FA_FLAG_PV8 : 0);
     kparams->fa_group  = (uint8_t) (opt_fa_group < 0 ? 0 : (opt_fa_group > 8 ? 8 : opt_fa_group));
 
     return true;
@@ -6827,6 +6832,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_HFCOMB")) { opt_mm_int_hfcomb = atoi(s); }
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_ILV"))    { opt_mm_int_ilv    = atoi(s); }
     if (const char * s = getenv("GGML_HEXAGON_INT_HMX_OVL"))    { opt_mm_int_ovl    = atoi(s); }
+    if (const char * s = getenv("GGML_HEXAGON_FA_QK8"))         { opt_fa_qk8        = atoi(s); }
+    if (const char * s = getenv("GGML_HEXAGON_FA_PV8"))         { opt_fa_pv8        = atoi(s); }
     const char * str_mm_int    = getenv("GGML_HEXAGON_INT_HMX");
     const char * str_mm_int_minrows = getenv("GGML_HEXAGON_INT_HMX_MINROWS");
     const char * str_mm_int_nc = getenv("GGML_HEXAGON_INT_HMX_NC");
