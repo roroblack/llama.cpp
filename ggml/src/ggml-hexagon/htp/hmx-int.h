@@ -221,6 +221,107 @@ static inline void hmxi_cvt_run(const uint8_t * src, int b0, int b1, uint8_t * w
     if (b < b1) hmxi_cvt_tile(src + (size_t) b * 576, (HVX_Vector *) (wt + (size_t) b * 1024), cv + b, dv + b);
 }
 
+// HTP_TENSOR_GPUT (GGML_HEXAGON_SHARED_WEIGHTS): the same tile from the OpenCL layout. Rows of 64 B (one 16-bit word of
+// 4 values per matrix row, low nibble first) lie gs = 2*M apart; the tile's 8 quant rows start at q0, its 32 fp16 scales at
+// d0. Loads are 128-B aligned and pick the half they need (rows are 64-B aligned), so nothing past a row is read.
+// The nibble split + byte interleave alone gives the HMX row (4 consecutive k per column); outputs equal hmxi_cvt_tile's.
+static inline HVX_Vector hmxi_ld64(const uint8_t * p, int upper) {
+    const HVX_Vector a = *(const HVX_Vector *) ((uintptr_t) p & ~(uintptr_t) 127);
+    const int in_upper = ((uintptr_t) p & 64) != 0;
+    return Q6_V_vror_VR(a, (in_upper ^ upper) ? 64 : 0);
+}
+
+// x[v] = rows 2v | 2v+1 of the tile (64 B each), xs = its 32 fp16 scales in the upper half
+static inline __attribute__((always_inline)) void hmxi_cvt_core_gput(const HVX_Vector * x, HVX_Vector xs, HVX_Vector * restrict wt,
+                                                                     HVX_Vector * restrict cv, HVX_Vector * restrict dv) {
+    const HVX_Vector     k0f     = Q6_V_vsplat_R(0x0f0f0f0f);
+    const HVX_Vector     k08     = Q6_V_vsplat_R(0x08080808);
+    HVX_Vector           sumq    = Q6_V_vzero();
+#pragma unroll
+    for (int v = 0; v < 4; v++) {
+        HVX_Vector     lo = Q6_V_vand_VV(x[v], k0f);
+        HVX_Vector     hi = Q6_V_vand_VV(Q6_Vuh_vlsr_VuhR(x[v], 4), k0f);
+        HVX_VectorPair p  = Q6_W_vshuff_VVR(hi, lo, -1);
+        HVX_Vector     t0 = Q6_V_lo_W(p);
+        HVX_Vector     t1 = Q6_V_hi_W(p);
+        sumq = Q6_Vuw_vrmpyacc_VuwVubRub(sumq, t0, 0x01010101);
+        sumq = Q6_Vuw_vrmpyacc_VuwVubRub(sumq, t1, 0x01010101);
+        wt[2 * v]     = Q6_Vb_vsub_VbVb(t0, k08);
+        wt[2 * v + 1] = Q6_Vb_vsub_VbVb(t1, k08);
+    }
+    HVX_Vector c = Q6_V_vand_VV(Q6_Vw_vasl_VwR(Q6_Vw_vsub_VwVw(sumq, Q6_V_vsplat_R(256)), 7), Q6_V_vsplat_R(0xffff));
+    *cv = Q6_V_vor_VV(c, Q6_Vw_vasl_VwR(c, 16));
+
+    HVX_VectorPair w  = Q6_Wuw_vzxt_Vuh(xs);
+    HVX_VectorPair s  = Q6_W_vshuff_VVR(Q6_V_hi_W(w), Q6_V_lo_W(w), -4);
+    HVX_Vector     hb = Q6_V_hi_W(s);
+    const HVX_Vector sign = Q6_Vw_vasl_VwR(Q6_V_vand_VV(hb, Q6_V_vsplat_R(0x8000)), 16);
+    const HVX_Vector mag  = Q6_V_vand_VV(hb, Q6_V_vsplat_R(0x7fff));
+    const HVX_Vector nrm  = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(mag, 13), Q6_V_vsplat_R(0x3c000000));
+    const HVX_Vector sub  = Q6_Vw_vsub_VwVw(Q6_Vsf_equals_Vw(mag), Q6_V_vsplat_R(16 << 23));
+    HVX_Vector r = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(mag, Q6_V_vsplat_R(0x3ff)), nrm, sub);
+    r = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(mag, Q6_V_vzero()), Q6_V_vzero(), r);
+    *dv = Q6_V_vor_VV(r, sign);
+}
+
+static inline __attribute__((always_inline)) void hmxi_cvt_body_gput(const uint8_t * restrict q0, size_t gs, const uint8_t * restrict d0,
+                                                                     HVX_Vector * restrict wt, HVX_Vector * restrict cv,
+                                                                     HVX_Vector * restrict dv) {
+    const HVX_VectorPred first64 = Q6_Q_vsetq_R(64);
+    HVX_Vector x[4];
+#pragma unroll
+    for (int v = 0; v < 4; v++) {
+        x[v] = Q6_V_vmux_QVV(first64, hmxi_ld64(q0 + (2 * v) * gs, 0), hmxi_ld64(q0 + (2 * v + 1) * gs, 1));
+    }
+    hmxi_cvt_core_gput(x, hmxi_ld64(d0, 1), wt, cv, dv);   // scales in the upper half, as in hmxi_cvt_body
+}
+
+// Column tiles ct (even) and ct+1 share every 128-B line of the OpenCL arrays: one aligned load per row gives both, a
+// 64-B shuffle of rows 2v and 2v+1 gives each tile its x[v] (hmxi_cvt_body_gput uses half of each line it loads).
+// q0, d0 128-B aligned and gs a multiple of 128. Outputs equal two hmxi_cvt_body_gput calls.
+static inline __attribute__((always_inline)) void hmxi_cvt_body_gput2(const uint8_t * restrict q0, size_t gs, const uint8_t * restrict d0,
+                                                                      HVX_Vector * restrict wa, HVX_Vector * restrict cva,
+                                                                      HVX_Vector * restrict dva, HVX_Vector * restrict wb,
+                                                                      HVX_Vector * restrict cvb, HVX_Vector * restrict dvb) {
+    HVX_Vector xa[4], xb[4];
+#pragma unroll
+    for (int v = 0; v < 4; v++) {
+        const HVX_VectorPair t = Q6_W_vshuff_VVR(*(const HVX_Vector *) (q0 + (2 * v + 1) * gs), *(const HVX_Vector *) (q0 + (2 * v) * gs), -64);
+        xa[v] = Q6_V_lo_W(t);
+        xb[v] = Q6_V_hi_W(t);
+    }
+    const HVX_Vector ds = *(const HVX_Vector *) d0;             // scales of tile a | tile b
+    hmxi_cvt_core_gput(xa, Q6_V_vror_VR(ds, 64), wa, cva, dva);
+    hmxi_cvt_core_gput(xb, ds, wb, cvb, dvb);
+}
+
+// tiles b0 .. b1-1 of column tiles ct (even) and ct+1 into (wa, cva, dva) and (wb, cvb, dvb)
+static void __attribute__((noinline)) hmxi_cvt_run_gput2(const uint8_t * q, const uint8_t * d, size_t gs, int ct, int b0, int b1,
+                                                        uint8_t * wa, HVX_Vector * cva, HVX_Vector * dva,
+                                                        uint8_t * wb, HVX_Vector * cvb, HVX_Vector * dvb) {
+    for (int b = b0; b < b1; b++) {
+        hmxi_cvt_body_gput2(q + (size_t) (8 * b) * gs + (size_t) ct * 64, gs, d + (size_t) b * gs + (size_t) ct * 64,
+                            (HVX_Vector *) (wa + (size_t) b * 1024), cva + b, dva + b,
+                            (HVX_Vector *) (wb + (size_t) b * 1024), cvb + b, dvb + b);
+    }
+}
+
+// tiles b0 .. b1-1 of column tile ct (q, d = bases of the OpenCL arrays, gs = 2*M), two at a time
+static void __attribute__((noinline)) hmxi_cvt_run_gput(const uint8_t * q, const uint8_t * d, size_t gs, int ct, int b0, int b1,
+                                                       uint8_t * wt, HVX_Vector * cv, HVX_Vector * dv) {
+    int b = b0;
+    for (; b + 2 <= b1; b += 2) {
+        hmxi_cvt_body_gput(q + (size_t) (8 * b) * gs + (size_t) ct * 64, gs, d + (size_t) b * gs + (size_t) ct * 64,
+                           (HVX_Vector *) (wt + (size_t) b * 1024), cv + b, dv + b);
+        hmxi_cvt_body_gput(q + (size_t) (8 * (b + 1)) * gs + (size_t) ct * 64, gs, d + (size_t) (b + 1) * gs + (size_t) ct * 64,
+                           (HVX_Vector *) (wt + (size_t) (b + 1) * 1024), cv + b + 1, dv + b + 1);
+    }
+    if (b < b1) {
+        hmxi_cvt_body_gput(q + (size_t) (8 * b) * gs + (size_t) ct * 64, gs, d + (size_t) b * gs + (size_t) ct * 64,
+                           (HVX_Vector *) (wt + (size_t) b * 1024), cv + b, dv + b);
+    }
+}
+
 // a whole column tile (B blocks) plus mid = 128 * sum_b d_b = 0.5 * sum_b dv_b.
 // Converts two tiles at a time first, then sums dv in the original b order: the qf32 additions happen in the same
 // order as before, so mid is bit-identical.

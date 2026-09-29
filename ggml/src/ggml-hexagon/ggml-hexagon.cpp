@@ -32,6 +32,10 @@
 #else
 #    include <semaphore.h>
 #    include <unistd.h>
+#    include <sys/mman.h>
+#    include <sys/socket.h>
+#    include <sys/stat.h>
+#    include <sys/un.h>
 #endif
 
 #pragma clang diagnostic ignored "-Wnested-anon-types"
@@ -297,6 +301,7 @@ enum ggml_hexagon_tensor_flags {
     GGML_HEXAGON_TENSOR_WEIGHT    = (1 << 1),
     GGML_HEXAGON_TENSOR_FENCE     = (1 << 2),
     GGML_HEXAGON_TENSOR_FUSEABLE  = (1 << 3),
+    GGML_HEXAGON_TENSOR_SHARED    = (1 << 4),  // Q4_0 weight read from the GPU server's copy (GGML_HEXAGON_SHARED_WEIGHTS)
 };
 
 static inline bool ggml_hexagon_is_repack_type(enum ggml_type type) {
@@ -394,6 +399,9 @@ struct ggml_hexagon_tensor_extra {
     std::vector<uint8_t> shadow_buf;
     size_t               shadow_size { 0 };
     uint32_t             flags { 0 };
+    int                  ws_fi { -1 };  // GGML_HEXAGON_TENSOR_SHARED: shared dma-buf index, d and q offsets in it
+    uint32_t             ws_d { 0 };
+    uint32_t             ws_q { 0 };
 };
 
 static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
@@ -441,6 +449,9 @@ struct ggml_hexagon_session {
     ggml_hexagon_opqueue* op_queue;
 
     std::unordered_map<int, std::unique_ptr<ggml_hexagon_shared_buffer>> cloned_buffers;
+    std::vector<std::unique_ptr<ggml_hexagon_shared_buffer>>             wshare_bufs;  // GGML_HEXAGON_SHARED_WEIGHTS
+
+    ggml_hexagon_shared_buffer * wshare_buf(int fi);
     std::unordered_set<ggml_hexagon_session *>                           sync_peers;
 
     uint32_t n_threads   = 0;
@@ -533,6 +544,20 @@ struct ggml_hexagon_rpcmem_block {
     uint8_t * base = nullptr;
     int       fd   = -1;
     size_t    size = 0;
+    bool      imported = false;  // a dma-buf received from another process: mapped here, not an rpcmem allocation
+
+#ifndef _WIN32
+    ggml_hexagon_rpcmem_block(int fd_in, size_t size_in) {
+        void * p = ::mmap(nullptr, size_in, PROT_READ | PROT_WRITE, MAP_SHARED, fd_in, 0);
+        if (p == MAP_FAILED) {
+            throw std::runtime_error("ggml-hex: mmap of a shared-weights dma-buf failed");
+        }
+        base     = (uint8_t *) p;
+        fd       = fd_in;
+        size     = size_in;
+        imported = true;
+    }
+#endif
 
     ggml_hexagon_rpcmem_block(size_t size) {
         base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
@@ -548,6 +573,13 @@ struct ggml_hexagon_rpcmem_block {
     }
 
     ~ggml_hexagon_rpcmem_block() {
+#ifndef _WIN32
+        if (imported) {
+            ::munmap(base, size);
+            ::close(fd);
+            return;
+        }
+#endif
         if (base) {
             rpcmem_free(base);
         }
@@ -647,6 +679,16 @@ struct ggml_hexagon_shared_buffer {
         alloc(total_size);
     }
 
+    // an imported dma-buf (GGML_HEXAGON_SHARED_WEIGHTS), mapped for this session right away
+    ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, std::shared_ptr<ggml_hexagon_rpcmem_block> m) {
+        this->sess        = sess;
+        this->mem         = std::move(m);
+        this->mapped      = false;
+        this->pinned      = true;
+        this->fences_size = 0;
+        mmap();
+    }
+
     // Clone constructor for cross-session mapping
     ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, const ggml_hexagon_shared_buffer & other) {
         this->sess        = sess;
@@ -663,6 +705,128 @@ struct ggml_hexagon_shared_buffer {
         }
     }
 };
+
+// GGML_HEXAGON_SHARED_WEIGHTS=<unix socket of a GPU server started with GGML_OPENCL_SHARE_SOCK>: Q4_0 weights that the
+// GPU server holds in layout 1 (quants unshuffled, q and d transposed as 16-bit words; see ggml-opencl.cpp) are read from
+// its dma-buf instead of a repacked copy of our own. Such a tensor asks for 128 bytes only (a unique address: tensors are
+// matched by data pointer and shape when a batch is built), is never written, and goes to the NPU as a repacked Q4_0
+// with HTP_TENSOR_GPUT: the NPU fetches its tiles from the GPU layout (q at data, d at reserved) and compute is unchanged.
+struct ggml_hexagon_wshare_entry {
+    int      fi;
+    int64_t  ne0, ne1, ne2;
+    uint32_t d_off, q_off;
+};
+
+struct ggml_hexagon_wshare {
+    bool                                                        loaded = false;
+    std::unordered_map<std::string, ggml_hexagon_wshare_entry> map;
+    std::vector<std::shared_ptr<ggml_hexagon_rpcmem_block>>    mem;  // one per received fd
+};
+
+static ggml_hexagon_wshare & ggml_hexagon_wshare_get() {
+    static ggml_hexagon_wshare ws;
+    static std::once_flag      once;
+    std::call_once(once, [] {
+#ifndef _WIN32
+        const char * path = getenv("GGML_HEXAGON_SHARED_WEIGHTS");
+        if (!path || !*path) return;
+        int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_un a = {};
+        a.sun_family = AF_UNIX;
+        strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
+        if (s < 0 || connect(s, (sockaddr *) &a, sizeof(a)) < 0) {
+            GGML_LOG_WARN("ggml-hex: shared weights: cannot connect to %s, using our own copy\n", path);
+            if (s >= 0) close(s);
+            return;
+        }
+        uint64_t len = 0;
+        iovec iov = { &len, sizeof(len) };
+        char cbuf[CMSG_SPACE(sizeof(int) * 64)] = {};
+        msghdr m = {};
+        m.msg_iov        = &iov;
+        m.msg_iovlen     = 1;
+        m.msg_control    = cbuf;
+        m.msg_controllen = sizeof(cbuf);
+        std::vector<int> fds;
+        if (recvmsg(s, &m, MSG_CMSG_CLOEXEC) == (ssize_t) sizeof(len)) {
+            for (cmsghdr * cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm)) {
+                if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+                    const size_t n = (cm->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                    fds.resize(n);
+                    memcpy(fds.data(), CMSG_DATA(cm), n * sizeof(int));
+                }
+            }
+        }
+        std::string text(len, '\0');
+        size_t got = 0;
+        while (got < len) {
+            ssize_t r = read(s, &text[got], len - got);
+            if (r <= 0) break;
+            got += (size_t) r;
+        }
+        close(s);
+        if (got != len || fds.empty()) {
+            GGML_LOG_WARN("ggml-hex: shared weights: incomplete reply from %s, using our own copy\n", path);
+            for (int fd : fds) close(fd);
+            return;
+        }
+        try {
+            for (int fd : fds) {
+                struct stat st = {};
+                size_t sz = 0;
+                if (fstat(fd, &st) == 0 && st.st_size > 0) sz = (size_t) st.st_size;
+                if (sz == 0) { off_t e = lseek(fd, 0, SEEK_END); sz = e > 0 ? (size_t) e : 0; }
+                ws.mem.push_back(std::make_shared<ggml_hexagon_rpcmem_block>(fd, sz));
+            }
+        } catch (const std::exception & e) {
+            GGML_LOG_WARN("ggml-hex: shared weights: %s, using our own copy\n", e.what());
+            ws.mem.clear();
+            return;
+        }
+        std::istringstream in(text);
+        std::string line;
+        size_t bytes = 0;
+        while (std::getline(in, line)) {
+            std::istringstream l(line);
+            ggml_hexagon_wshare_entry e = {};
+            std::string name;
+            size_t d = 0, q = 0;
+            int layout = 0;
+            if (!(l >> e.fi >> name >> e.ne0 >> e.ne1 >> e.ne2 >> d >> q >> layout)) continue;
+            if (layout != 1 || e.fi < 0 || e.fi >= (int) ws.mem.size()) continue;
+            if (e.ne0 % 32 != 0 || e.ne1 % 32 != 0 || e.ne2 != 1) continue;
+            const size_t nq = (size_t) e.ne0 * e.ne1 / 2, nd = (size_t) e.ne0 / 32 * e.ne1 * 2;
+            if (q + nq > ws.mem[e.fi]->size || d + nd > ws.mem[e.fi]->size || q > UINT32_MAX || d > UINT32_MAX) continue;
+            e.d_off = (uint32_t) d;
+            e.q_off = (uint32_t) q;
+            ws.map[name] = e;
+            bytes += nq + nd;
+        }
+        ws.loaded = !ws.map.empty();
+        GGML_LOG_INFO("ggml-hex: shared weights: %zu Q4_0 tensors (%.1f MiB) from %s in %zu dma-bufs\n", ws.map.size(),
+                      bytes / 1048576.0, path, ws.mem.size());
+#endif
+    });
+    return ws;
+}
+
+ggml_hexagon_shared_buffer * ggml_hexagon_session::wshare_buf(int fi) {
+    auto & ws = ggml_hexagon_wshare_get();
+    if (wshare_bufs.size() < ws.mem.size()) wshare_bufs.resize(ws.mem.size());
+    if (!wshare_bufs[fi]) wshare_bufs[fi] = std::make_unique<ggml_hexagon_shared_buffer>(this, ws.mem[fi]);
+    return wshare_bufs[fi].get();
+}
+
+static const ggml_hexagon_wshare_entry * ggml_hexagon_wshare_find(const ggml_tensor * t) {
+    if (t->type != GGML_TYPE_Q4_0 || t->ne[3] != 1) return nullptr;
+    auto & ws = ggml_hexagon_wshare_get();
+    if (!ws.loaded) return nullptr;
+    auto it = ws.map.find(t->name);
+    if (it == ws.map.end()) return nullptr;
+    const auto & e = it->second;
+    if (e.ne0 != t->ne[0] || e.ne1 != t->ne[1] || e.ne2 != t->ne[2]) return nullptr;
+    return &e;
+}
 
 static ggml_hexagon_session * ggml_backend_hexagon_buffer_get_sess(ggml_backend_buffer_t buffer) {
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
@@ -690,6 +854,14 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     sbuf->tensor_extra.push_back(extra);
 
     tensor->extra = extra;
+    if (const auto * e = ggml_hexagon_wshare_find(tensor)) {
+        extra->flags |= GGML_HEXAGON_TENSOR_SHARED | GGML_HEXAGON_TENSOR_WEIGHT | GGML_HEXAGON_TENSOR_REPACK;
+        extra->ws_fi = e->fi;
+        extra->ws_d  = e->d_off;
+        extra->ws_q  = e->q_off;
+        sess->needs_repack.erase(tensor);
+        return GGML_STATUS_SUCCESS;
+    }
     if (ggml_hexagon_is_repack_type(tensor->type)) {
         if (sess->needs_repack.count(tensor)) {
             extra->flags |= GGML_HEXAGON_TENSOR_REPACK;
@@ -1312,6 +1484,10 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     auto sbuf  = (ggml_hexagon_shared_buffer *) buffer->context;
     auto sess  = sbuf->sess;
 
+    if ((extra->flags & GGML_HEXAGON_TENSOR_SHARED) != 0) {
+        return;  // the GPU server's copy is used
+    }
+
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         extra->flags |= GGML_HEXAGON_TENSOR_WEIGHT;
         if (ggml_hexagon_is_repack_type(tensor->type)) {
@@ -1422,6 +1598,10 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
     auto extra = (ggml_hexagon_tensor_extra *)  tensor->extra;
     auto sbuf  = (ggml_hexagon_shared_buffer *) buffer->context;
     auto sess  = sbuf->sess;
+
+    if ((extra->flags & GGML_HEXAGON_TENSOR_SHARED) != 0) {
+        return;  // the GPU server's copy is used
+    }
 
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         extra->flags |= GGML_HEXAGON_TENSOR_WEIGHT;
@@ -1614,6 +1794,10 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
+    // below ggml_nbytes on purpose: the weight lives in the GPU server's dma-buf (the size assert is debug-only)
+    if (ggml_hexagon_wshare_find(t)) {
+        return 128;
+    }
     if (ggml_hexagon_is_repack_type(t->type)) {
         int64_t ne0 = hex_round_up(t->ne[0], 32);
         int64_t ne1 = hex_round_up(t->ne[1], 32);
@@ -1835,6 +2019,15 @@ struct ggml_hexagon_opbatch {
             h.nb[0] = t->nb[0]; h.nb[1] = t->nb[1]; h.nb[2] = t->nb[2]; h.nb[3] = t->nb[3];
         }
 
+        if ((extra->flags & GGML_HEXAGON_TENSOR_SHARED) != 0) {
+            // GPU layout 1: q = [K/4][M] 16-bit words at data, d = [K/32][M] fp16 at data + (int32) reserved
+            h.bi       = add_buffer(sess->wshare_buf(extra->ws_fi));
+            h.data     = extra->ws_q;
+            h.reserved = (uint32_t) ((int64_t) extra->ws_d - (int64_t) extra->ws_q);  // the NPU rebases data only
+            h.size     = (uint32_t) (t->ne[0] * t->ne[1] / 2);
+            t_size     = h.size;
+        }
+
         h.flags = 0;
         if ((extra->flags & GGML_HEXAGON_TENSOR_WEIGHT) != 0) {
             h.flags |= HTP_TENSOR_WEIGHT;
@@ -1844,6 +2037,9 @@ struct ggml_hexagon_opbatch {
         }
         if ((extra->flags & GGML_HEXAGON_TENSOR_FENCE) != 0) {
             h.flags |= HTP_TENSOR_FENCE;
+        }
+        if ((extra->flags & GGML_HEXAGON_TENSOR_SHARED) != 0) {
+            h.flags |= HTP_TENSOR_GPUT;
         }
 
         HEX_VERBOSE("ggml-hex: %s add-tensor #%u %s : bi %d data %p offset %zu size %zu flags 0x%x : %zu:%zu:%zu:%zu\n", sess->c_name(),

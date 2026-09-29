@@ -40,6 +40,12 @@ struct hmxi_job {
     // W
     const uint8_t *            weight;
     int                        ct0, nct;
+    // HTP_TENSOR_GPUT: weight tiles come from the OpenCL layout (q at weight, d at gd, rows gs = 2*n apart)
+    int                        gput;
+    const uint8_t *            gd;
+    size_t                     gs;
+    // gput with 128-B aligned arrays and even group starts: column tiles converted in pairs (hmxi_cvt_run_gput2)
+    int                        gpair;
     // P
     float *                    dst;
     int                        dst_stride, dst_cols;
@@ -117,11 +123,39 @@ static void hmxi_job_quant(unsigned int n, unsigned int i, void * data) {
     }
 }
 
+static void hmxi_mid_from_dv(const HVX_Vector * dv, int B, HVX_Vector * mid);
+
+// conversion units: column tiles, or pairs of them (gpair)
+static inline int hmxi_cvt_units(const struct hmxi_job * j, int nct) { return j->gpair ? (nct + 1) / 2 : nct; }
+
+// blocks b0 .. b1-1 of conversion unit u (column tile ct0 + c, or the pair from it) into wt/cv/dv + column c
+static inline void hmxi_cvt_unit_gput(const struct hmxi_job * j, int ct0, int nct, int u, int b0, int b1, uint8_t * wt,
+                                      HVX_Vector * cv, HVX_Vector * dv) {
+    const int B = j->L.B;
+    const int c = j->gpair ? 2 * u : u;
+    if (j->gpair && c + 1 < nct) {
+        hmxi_cvt_run_gput2(j->weight, j->gd, j->gs, ct0 + c, b0, b1, wt + (size_t) c * B * 1024, cv + c * B, dv + c * B,
+                           wt + (size_t) (c + 1) * B * 1024, cv + (c + 1) * B, dv + (c + 1) * B);
+    } else {
+        hmxi_cvt_run_gput(j->weight, j->gd, j->gs, ct0 + c, b0, b1, wt + (size_t) c * B * 1024, cv + c * B, dv + c * B);
+    }
+}
+
 static void hmxi_job_cvt(unsigned int n, unsigned int i, void * data) {
     struct hmxi_job * j = (struct hmxi_job *) data;
     const int B = j->L.B;
-    for (int c = (int) i; c < j->nct; c += (int) n)
+    if (j->gput) {
+        const int U = hmxi_cvt_units(j, j->nct);
+        for (int u = (int) i; u < U; u += (int) n) {
+            hmxi_cvt_unit_gput(j, j->ct0, j->nct, u, 0, B, j->wt, j->cv, j->dv);
+            const int c = j->gpair ? 2 * u : u, ce = (j->gpair && c + 1 < j->nct) ? c + 2 : c + 1;
+            for (int cc = c; cc < ce; cc++) hmxi_mid_from_dv(j->dv + cc * B, B, j->mid + cc);
+        }
+        return;
+    }
+    for (int c = (int) i; c < j->nct; c += (int) n) {
         hmxi_cvt_coltile(j->weight + (size_t) (j->ct0 + c) * B * 576, B, j->wt + (size_t) c * B * 1024, j->cv + c * B, j->dv + c * B, j->mid + c);
+    }
 }
 
 // Codex q25: when a group has fewer column tiles than workers (K=12288 -> nct=2), splitting by column
@@ -131,6 +165,13 @@ static void hmxi_job_cvt(unsigned int n, unsigned int i, void * data) {
 static void hmxi_job_cvt_k(unsigned int n, unsigned int i, void * data) {
     struct hmxi_job * j = (struct hmxi_job *) data;
     const int B = j->L.B, nkr = (B + HMXI_CVT_KRUN - 1) / HMXI_CVT_KRUN;
+    if (j->gput) {
+        for (int t = (int) i; t < hmxi_cvt_units(j, j->nct) * nkr; t += (int) n) {
+            const int b0 = (t % nkr) * HMXI_CVT_KRUN, b1 = B - b0 < HMXI_CVT_KRUN ? B : b0 + HMXI_CVT_KRUN;
+            hmxi_cvt_unit_gput(j, j->ct0, j->nct, t / nkr, b0, b1, j->wt, j->cv, j->dv);
+        }
+        return;
+    }
     for (int t = (int) i; t < j->nct * nkr; t += (int) n) {
         const int c = t / nkr, b0 = (t % nkr) * HMXI_CVT_KRUN;
         const int b1 = B - b0 < HMXI_CVT_KRUN ? B : b0 + HMXI_CVT_KRUN;
@@ -226,7 +267,11 @@ static inline int hmxi_cvt_steal(struct hmxi_job * j) {
     const int B = j->L.B, nkr = (B + HMXI_CVT_KRUN - 1) / HMXI_CVT_KRUN;
     const int c = t / nkr, b0 = (t % nkr) * HMXI_CVT_KRUN;
     const int b1 = B - b0 < HMXI_CVT_KRUN ? B : b0 + HMXI_CVT_KRUN;
-    hmxi_cvt_run(j->weight + (size_t) (j->nx_ct0 + c) * B * 576, b0, b1, j->nwt + (size_t) c * B * 1024, j->ncv + c * B, j->ndv + c * B);
+    if (j->gput) {
+        hmxi_cvt_unit_gput(j, j->nx_ct0, j->nx_nct, c, b0, b1, j->nwt, j->ncv, j->ndv);   // c = unit
+    } else {
+        hmxi_cvt_run(j->weight + (size_t) (j->nx_ct0 + c) * B * 576, b0, b1, j->nwt + (size_t) c * B * 1024, j->ncv + c * B, j->ndv + c * B);
+    }
     return 1;
 }
 
@@ -280,9 +325,11 @@ static void hmxi_job_consume(unsigned int n, unsigned int i, void * data) {
 
 // dst[m][dst_cols] (row stride dst_stride floats) = act[m][k] (row stride act_stride) x W^T,
 // W = host-repacked Q4_0 with n (padded to 32) output rows. Returns 0 on success.
+// gput: the weight is in the OpenCL layout (HTP_TENSOR_GPUT) with its scales at weight + gput_doff.
 static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_stride, int dst_cols,
                                const float * act, int act_stride, const uint8_t * weight,
-                               int m, int k, int n, int n_threads, int vtcm_size, int seg_cap, int fi, int hfcomb) {
+                               int m, int k, int n, int n_threads, int vtcm_size, int seg_cap, int fi, int hfcomb,
+                               int gput, int32_t gput_doff) {
     if (!ctx->hmx_queue || !ctx->work_queue) return -2;
     size_t V = (size_t) vtcm_size;
     if (V == 0 || V > ctx->vtcm_size) V = ctx->vtcm_size;
@@ -317,6 +364,9 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     J.dv   = (HVX_Vector *) (vtcm + J.L.off_dv);
     J.mid  = (HVX_Vector *) (vtcm + J.L.off_mid);
     J.act = act; J.act_stride = act_stride; J.weight = weight;
+    J.gput = gput;
+    J.gd   = gput ? weight + gput_doff : NULL;
+    J.gs   = 2 * (size_t) n;
     J.hfcomb = hfcomb & 1;
     J.ilv    = (hfcomb >> 1) & 1;
     J.nx_tasks = 0;
@@ -334,6 +384,8 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
     uint8_t * const    wt0 = J.wt;
     HVX_Vector * const cv0 = J.cv, * const dv0 = J.dv, * const mid0 = J.mid;
     const size_t hB = (size_t) gstep * J.L.B;
+    J.gpair = gput && ((uintptr_t) weight & 127) == 0 && ((uintptr_t) J.gd & 127) == 0 && (J.gs & 127) == 0 &&
+              ((gstep & 1) == 0 || gstep >= n_ct_all);
     for (int m0 = 0; m0 < m; m0 += J.L.mc) {
         J.m0 = m0; J.mr = m - m0 < J.L.mc ? m - m0 : J.L.mc; J.n_rt = (J.mr + 31) / 32;
         t0 = HAP_perf_get_pcycles();
@@ -352,13 +404,13 @@ static int hmx_mm_q4int_2d_f32(struct htp_context * ctx, float * dst, int dst_st
                 J.nwt = wt0 + (size_t) (buf ^ 1) * hB * 1024; J.ncv = cv0 + (buf ^ 1) * hB; J.ndv = dv0 + (buf ^ 1) * hB;
                 J.nx_ct0 = ct0 + gstep;
                 J.nx_nct = n_ct_all - J.nx_ct0 < gstep ? n_ct_all - J.nx_ct0 : gstep;
-                J.nx_tasks = J.nx_nct * ((J.L.B + HMXI_CVT_KRUN - 1) / HMXI_CVT_KRUN);
+                J.nx_tasks = (J.gput ? hmxi_cvt_units(&J, J.nx_nct) : J.nx_nct) * ((J.L.B + HMXI_CVT_KRUN - 1) / HMXI_CVT_KRUN);
                 atomic_store(&J.nx_next, 0);
             }
             t0 = HAP_perf_get_pcycles();
             if (ovl && g > 0) {
                 // converted during the previous pipe; only the per-column mid is left
-            } else if (J.nct < (int) ctx->n_threads) {
+            } else if ((J.gput ? hmxi_cvt_units(&J, J.nct) : J.nct) < (int) ctx->n_threads) {
                 const int r = hmxi_fi_take(ctx, fi, HMXI_FI_CVT_K, "cvt_k") ? -8 : hmxi_wq(ctx, hmxi_job_cvt_k, &J, ctx->n_threads, -8);
                 if (r) return r;
                 for (int c = 0; c < J.nct; c++) hmxi_mid_from_dv(J.dv + c * J.L.B, J.L.B, J.mid + c);

@@ -127,7 +127,9 @@ enum htp_op_code {
 enum htp_tensor_flags {
     HTP_TENSOR_WEIGHT  = (1U << 0), // Tensor buffer model weight data (not compute)
     HTP_TENSOR_REPACK  = (1U << 1), // Tensor is in repacked tiled format
-    HTP_TENSOR_FENCE   = (1U << 2)  // Tensor is synchronization fence (explicitly managed)
+    HTP_TENSOR_FENCE   = (1U << 2), // Tensor is synchronization fence (explicitly managed)
+    HTP_TENSOR_GPUT    = (1U << 3)  // Repacked Q4_0 that lives in the OpenCL layout of another process: q [K/4][M]
+                                    // 16-bit words at data, d [K/32][M] fp16 at data + (int32_t) reserved
 };
 
 // Tensor descriptor
