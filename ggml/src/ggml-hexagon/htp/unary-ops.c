@@ -1297,11 +1297,93 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     return err;
 }
 
+// An element-wise F32 op on one long contiguous row runs on one thread (work is split by rows): gemma's final logit
+// softcap (SCALE, TANH, SCALE over 262144 logits) took 0.7 ms per decoded token that way. The result does not depend on
+// how the row is cut, so view it as R rows of ne0 / R (R = threads, rows a multiple of 32 floats) and redo the kernel
+// parameters for that view as the host does (ggml_hexagon_precompute_unary_params).
+static bool unary_is_elementwise(uint32_t op) {
+    switch (op) {
+        case HTP_OP_SCALE:
+        case HTP_OP_CLAMP:
+        case HTP_OP_LEAKY_RELU:
+        case HTP_OP_SQR:
+        case HTP_OP_SQRT:
+        case HTP_OP_UNARY_NEG:
+        case HTP_OP_UNARY_EXP:
+        case HTP_OP_UNARY_SIGMOID:
+        case HTP_OP_UNARY_SILU:
+        case HTP_OP_UNARY_GELU:
+        case HTP_OP_UNARY_SOFTPLUS:
+        case HTP_OP_UNARY_TANH:
+        case HTP_OP_UNARY_ABS:
+        case HTP_OP_UNARY_LOG:
+        case HTP_OP_UNARY_RELU:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int op_unary_split_row(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+    const uint32_t nth = octx->ctx->n_threads;
+    if (src0->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 || !unary_is_elementwise(octx->op) || nth < 2 ||
+        src0->ne[1] * src0->ne[2] * src0->ne[3] != 1 || dst->ne[0] != src0->ne[0] || src0->ne[0] % (32 * nth) != 0) {
+        return -1;
+    }
+    const uint32_t ne0 = src0->ne[0] / nth;
+    struct htp_tensor s = *src0, d = *dst;
+    s.ne[0] = d.ne[0] = ne0;
+    s.ne[1] = d.ne[1] = nth;
+    s.ne[2] = d.ne[2] = s.ne[3] = d.ne[3] = 1;
+    s.nb[1] = d.nb[1] = ne0 * sizeof(float);
+    s.nb[2] = d.nb[2] = s.nb[3] = d.nb[3] = ne0 * sizeof(float) * nth;
+
+    struct htp_unary_kernel_params kp;
+    memset(&kp, 0, sizeof(kp));
+    kp.n_threads             = nth;
+    kp.src0_row_size_aligned = hex_round_up(ne0 * sizeof(float), 128);
+    kp.dst_row_size_aligned  = kp.src0_row_size_aligned;
+    struct htp_unary_vtcm_layout L;
+    uint32_t col_tile = 0, rows_per_thread = 0;
+    htp_unary_vtcm_layout_build(&L, octx->op, ne0, ne0, 0, false, nth, octx->ctx->vtcm_size, sizeof(float), &col_tile,
+                                &rows_per_thread);
+    kp.col_tile                  = col_tile;
+    kp.vtcm_row_per_thread       = rows_per_thread;
+    kp.vtcm_size                 = L.total_bytes;
+    kp.vtcm_src0_size_per_thread = L.src0_bytes;
+    kp.vtcm_dst_size_per_thread  = L.dst_bytes;
+    kp.vtcm_src0_size            = L.src0_bytes * nth;
+    kp.vtcm_dst_size             = L.dst_bytes * nth;
+    kp.block                     = col_tile ? 0 : ((L.src0_bytes / 2) / kp.src0_row_size_aligned);
+    kp.div_ne01                  = init_fastdiv_values(nth);
+    kp.div_ne02                  = init_fastdiv_values(1);
+    kp.div_ne012                 = init_fastdiv_values(nth);
+    kp.div_tpr                   = init_fastdiv_values(col_tile ? (ne0 + col_tile - 1) / col_tile : 1);
+
+    int32_t saved[HTP_OP_MAX_KERN_PARAMS];
+    memcpy(saved, octx->kernel_params, sizeof(saved));
+    memcpy(octx->kernel_params, &kp, sizeof(kp));
+    octx->src[0] = &s;
+    octx->dst    = &d;
+    const int err = execute_op_unary(octx);
+    octx->src[0] = src0;
+    octx->dst    = dst;
+    memcpy(octx->kernel_params, saved, sizeof(saved));
+    return err;
+}
+
 int op_unary(struct htp_ops_context * octx) {
     switch (octx->src[0]->type) {
         case HTP_TYPE_F32:
-        case HTP_TYPE_F16:
+        case HTP_TYPE_F16: {
+            const int err = op_unary_split_row(octx);  // -1: not this case (HTP_STATUS_* are positive)
+            if (err != -1) {
+                return err;
+            }
             return execute_op_unary(octx);
+        }
 
         default:
             return HTP_STATUS_NO_SUPPORT;

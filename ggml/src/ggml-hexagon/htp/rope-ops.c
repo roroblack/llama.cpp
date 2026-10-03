@@ -207,6 +207,56 @@ static __attribute__((noinline)) void rope_cache_init(const float    theta_base,
     }
 }
 
+// Below v79 rope_cache_init computes every (cos, sin) pair with scalar cosf/sinf - 24 us for a 256-dim decode ROPE and
+// 43 us for 512 (SM8735, 2026-10-01), and a decoded token has 50 ROPEs (Q and K of each layer) with the same position and
+// only two (freq base, freq factors) sets. So each thread keeps the last few caches it computed (in DDR: scalar stores
+// and the scalar copy below stay coherent) and copies a match into its VTCM cache instead: the same values, computed
+// once per position and parameter set.
+#define ROPE_MEMO_N   4
+#define ROPE_MEMO_MAX 1024  // floats per cache (ne0)
+
+struct rope_memo_entry {
+    int32_t       pos;
+    uint32_t      ne0;
+    float         freq_scale, ext_factor, mscale, theta_scale, corr0, corr1;
+    const float * freq_factors;
+    uint32_t      valid;
+};
+
+static struct rope_memo_entry rope_memo_key[HTP_MAX_NTHREADS][ROPE_MEMO_N];
+static float __attribute__((aligned(128))) rope_memo_val[HTP_MAX_NTHREADS][ROPE_MEMO_N][ROPE_MEMO_MAX];
+static uint32_t rope_memo_next[HTP_MAX_NTHREADS];
+
+static void rope_cache_get(uint32_t ith, int32_t pos, float freq_scale, const float * freq_factors, float * corr_dims,
+                           uint32_t ne0, float ext_factor, float mscale, float * cache, float theta_scale) {
+#if __HVX_ARCH__ >= 79
+    const bool scalar_path = ext_factor != 0.0f;
+#else
+    const bool scalar_path = true;
+#endif
+    if (!scalar_path || ne0 > ROPE_MEMO_MAX || ith >= HTP_MAX_NTHREADS) {
+        rope_cache_init((float) pos, freq_scale, freq_factors, corr_dims, ne0, ext_factor, mscale, cache, theta_scale);
+        return;
+    }
+    const struct rope_memo_entry key = { pos, ne0, freq_scale, ext_factor, mscale, theta_scale, corr_dims[0], corr_dims[1],
+                                         freq_factors, 1 };
+    for (uint32_t e = 0; e < ROPE_MEMO_N; e++) {
+        const struct rope_memo_entry * k = &rope_memo_key[ith][e];
+        if (k->valid && k->pos == key.pos && k->ne0 == key.ne0 && k->freq_scale == key.freq_scale &&
+            k->ext_factor == key.ext_factor && k->mscale == key.mscale && k->theta_scale == key.theta_scale &&
+            k->corr0 == key.corr0 && k->corr1 == key.corr1 && k->freq_factors == key.freq_factors) {
+            memcpy(cache, rope_memo_val[ith][e], ne0 * sizeof(float));
+            return;
+        }
+    }
+    const uint32_t e = rope_memo_next[ith];
+    rope_memo_next[ith] = (e + 1) % ROPE_MEMO_N;
+    rope_cache_init((float) pos, freq_scale, freq_factors, corr_dims, ne0, ext_factor, mscale, rope_memo_val[ith][e],
+                    theta_scale);
+    rope_memo_key[ith][e] = key;
+    memcpy(cache, rope_memo_val[ith][e], ne0 * sizeof(float));
+}
+
 // pos_t/h/w/e: the four position ids for this sequence step (t=time, h=height, w=width, e=extra).
 // sections[4]: number of head dims assigned to each position component.
 static __attribute__((noinline)) void mrope_cache_init(const float    pos_t,
@@ -557,9 +607,9 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                             ne0, rctx->ext_factor, rctx->attn_factor,
                             theta_cache, rctx->theta_scale);
                     } else {
-                       rope_cache_init(pos[i2], rctx->freq_scale, freq_factors, rctx->corr_dims,
-                                        ne0, rctx->ext_factor, rctx->attn_factor,
-                                        theta_cache, rctx->theta_scale);
+                       rope_cache_get(ith, pos[i2], rctx->freq_scale, freq_factors, rctx->corr_dims,
+                                      ne0, rctx->ext_factor, rctx->attn_factor,
+                                      theta_cache, rctx->theta_scale);
                     }
                 }
 

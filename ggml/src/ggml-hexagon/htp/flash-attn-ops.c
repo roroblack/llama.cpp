@@ -742,14 +742,23 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
     const HVX_Vector vmin      = Q6_Vh_vsplat_R(0xFBFF);
     const HVX_Vector v_log2e   = hvx_vec_splat_f16(EXP_LOG2E_F);
 
+    // One query token (decode): the rows are heads, and the heads of a GQA group read the same K/V - per head they were
+    // fetched again (8 query heads per KV head: 8 reads of the same blocks, FA was memory-bound at 1536 keys, 431 us).
+    // Then a group is consecutive heads of one KV head: one fetch per block for all of them. Each head is computed as
+    // before (fp16 QK/PV, its own mask row = the token's), so the results stay the same. Not with ALiBi (per-head slope)
+    // or a mask with several heads.
+    const uint32_t rk2   = neq2 / k->ne[2];
+    const bool     heads = neq1 == 1 && rk2 > 1 && factx->max_bias == 0.0f && (!mask || mask->ne[2] == 1);
+
     for (uint32_t ir = ir0; ir < ir1; ) {
         const uint32_t iq3 = fastdiv(ir, &factx->src0_div21);
         const uint32_t iq2 = fastdiv(ir - iq3*neq2*neq1, &factx->src0_div1);
         const uint32_t iq1 = (ir - iq3*neq2*neq1 - iq2 * neq1);
-        // consecutive rows of the same head are consecutive tokens until iq1 wraps
-        const uint32_t gn = MIN(MIN(G, ir1 - ir), neq1 - iq1);
-        uint8_t * const x8  = gn >= FA_INT8_MIN_ROWS ? x8t : NULL;
-        uint8_t * const vq8 = gn >= FA_INT8_MIN_ROWS ? vq8t : NULL;
+        // consecutive rows of the same head are consecutive tokens until iq1 wraps; in head mode, consecutive heads of
+        // one KV head
+        const uint32_t gn = heads ? MIN(MIN(G, ir1 - ir), rk2 - iq2 % rk2) : MIN(MIN(G, ir1 - ir), neq1 - iq1);
+        uint8_t * const x8  = !heads && gn >= FA_INT8_MIN_ROWS ? x8t : NULL;
+        uint8_t * const vq8 = !heads && gn >= FA_INT8_MIN_ROWS ? vq8t : NULL;
 
         const uint32_t ik3 = fastdiv(iq3, &factx->broadcast_rk3);
         const uint32_t ik2 = fastdiv(iq2, &factx->broadcast_rk2);
@@ -757,15 +766,24 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
         const uint32_t iv2 = fastdiv(iq2, &factx->broadcast_rv2);
 
         const uint8_t * q_src = (const uint8_t *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3);
-        dma_queue_push(dma, dma_make_ptr(spad_q, q_src), factx->size_q_row_padded, nbq1, size_q_row, gn);
+        dma_queue_push(dma, dma_make_ptr(spad_q, q_src), factx->size_q_row_padded, heads ? nbq2 : nbq1, size_q_row, gn);
         if (mask) {
             const uint32_t im2 = fastmodulo(iq2, mask->ne[2], &factx->src3_div2);
             const uint32_t im3 = fastmodulo(iq3, mask->ne[3], &factx->src3_div3);
             const uint8_t * m_src = (const uint8_t *) mask->data + iq1*mask->nb[1] + im2*mask->nb[2] + im3*mask->nb[3];
-            dma_queue_push(dma, dma_make_ptr(spad_m, m_src), mrow, mask->nb[1], nek1 * sizeof(__fp16), gn);
+            // head mode: every head of the group uses the token's mask row - fetched once, copied below (a DMA source
+            // stride of 0 gave wrong rows: garbage answers, 2026-10-02)
+            dma_queue_push(dma, dma_make_ptr(spad_m, m_src), mrow, mask->nb[1], nek1 * sizeof(__fp16), heads ? 1 : gn);
         }
         dma_queue_pop(dma);
         if (mask) dma_queue_pop(dma);
+        if (mask && heads) {
+            for (uint32_t r = 1; r < gn; r++) {
+                for (uint32_t i = 0; i < mrow / 128; i++) {
+                    ((HVX_Vector *) (spad_m + r * mrow))[i] = ((const HVX_Vector *) spad_m)[i];
+                }
+            }
+        }
 
         if (factx->is_q_fp32) {
             for (uint32_t r = 0; r < gn; r++) {
@@ -935,8 +953,10 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
             float * VKQ32 = (float *) (spad_a + r * factx->size_vkq_acc);
             float M = hvx_vec_get_f32(M_vec[r]);
             float S = hvx_vec_get_f32(S_vec[r]);
+            const uint32_t hr = heads ? iq2 + r : iq2;       // this row's head
+            const uint32_t tr_ = heads ? iq1 : iq1 + r;      // and token
             if (sinks) {
-                const float s = ((float *)((char *) sinks->data))[iq2];
+                const float s = ((float *)((char *) sinks->data))[hr];
                 float vs = 1.0f;
                 if (s > M) {
                     HVX_Vector ms_vec = hvx_vec_exp_f32(hvx_vec_splat_f32(M - s));
@@ -950,7 +970,7 @@ static void flash_attn_ext_f16_thread_grp(unsigned int nth, unsigned int ith, vo
             const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
             hvx_scale_f32_aa((uint8_t *) VKQ32, (const uint8_t *) VKQ32, DV, S_inv);
 
-            uint8_t * dst_ptr = (uint8_t *) dst->data + iq2 * dst->nb[1] + (iq1 + r) * dst->nb[2] + iq3 * dst->nb[3];
+            uint8_t * dst_ptr = (uint8_t *) dst->data + hr * dst->nb[1] + tr_ * dst->nb[2] + iq3 * dst->nb[3];
             if (dst->type == HTP_TYPE_F32) {
                 hvx_copy_f32_ua(dst_ptr, (uint8_t *) VKQ32, DV);
             } else if (dst->type == HTP_TYPE_F16) {

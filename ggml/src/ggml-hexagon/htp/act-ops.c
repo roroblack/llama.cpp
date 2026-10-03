@@ -472,17 +472,23 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
             return HTP_STATUS_NO_SUPPORT;
     }
 
-    const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    // A decoded token's FFN is one row (6144 / 12288 values) and work is split by rows, so it ran on one thread (GEGLU
+    // 16 / 28 us). The GLU ops are element-wise: one row is cut into n_threads rows of the same contiguous data.
+    uint32_t nsplit = 1;
+    if (src0->ne[1] * src0->ne[2] * src0->ne[3] == 1 && octx->n_threads > 1 && dst->ne[0] % (32 * octx->n_threads) == 0) {
+        nsplit = octx->n_threads;
+    }
+    const uint32_t src0_nrows = nsplit > 1 ? nsplit : src0->ne[1] * src0->ne[2] * src0->ne[3];
     const uint32_t n_threads  = MIN(octx->n_threads, src0_nrows);
 
     // row_size   = bytes of useful data per row (what the kernel touches / what DMA copies).
     // row_stride = bytes between successive rows in DDR (may exceed row_size for non-contig src).
-    const size_t nc_bytes    = dst->ne[0] * SIZEOF_FP32;
+    const size_t nc_bytes    = dst->ne[0] / nsplit * SIZEOF_FP32;
     const size_t src0_row_size = nc_bytes;
     const size_t src1_row_size = nc_bytes;
     const size_t dst_row_size  = nc_bytes;
-    const size_t src0_row_stride = src0->nb[1];
-    const size_t src1_row_stride = src1 ? src1->nb[1] : src0->nb[1];
+    const size_t src0_row_stride = nsplit > 1 ? nc_bytes : src0->nb[1];
+    const size_t src1_row_stride = nsplit > 1 ? nc_bytes : (src1 ? src1->nb[1] : src0->nb[1]);
 
     const size_t src0_row_size_aligned = hex_round_up(src0_row_size, VLEN);
     const size_t src1_row_size_aligned = hex_round_up(src1_row_size, VLEN);
@@ -547,7 +553,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     actx.block = actx.src0_spad_half_size / actx.src0_row_size_aligned;
     actx.src0_nrows = src0_nrows;
 
-    actx.nc = dst->ne[0];
+    actx.nc = dst->ne[0] / nsplit;
 
     // Pointers and GLU logic
     const uint8_t * data_src0 = (const uint8_t *) src0->data;
@@ -558,7 +564,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
          data_src1 = data_src0;
          actx.src1_row_size = actx.src0_row_size;
 
-         size_t nc_in_bytes = actx.nc * SIZEOF_FP32;
+         size_t nc_in_bytes = dst->ne[0] * SIZEOF_FP32;  // the whole row, also when it is split
          if (swapped) {
              data_src0 += nc_in_bytes;
          } else {
