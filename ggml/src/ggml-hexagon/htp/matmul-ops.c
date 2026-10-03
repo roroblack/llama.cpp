@@ -772,8 +772,11 @@ MATMUL_NX_2D_REPACKED_IMPL(mxfp4_flat, 544, flat_vec_dot_mxfp4_32x2, flat_vec_do
 // chunks of 3/6/12/48 k-tiles: 78.7/67.0/59.8/56.2 cycles per (column tile x k-tile) (2026-10-01); a bigger first chunk
 // delays the first compute, so not the whole K
 #define HVX_GPUT_KC_TARGET 24
-// per-thread 8 * sum(a) of each activation k-tile for tiled_vec_dot_q4_0_gput_rs_64x1_c (K up to 32 * HVX_GPUT_CORR_MAX)
-#define HVX_GPUT_CORR_MAX 512
+// per-thread 8 * sum(a) of each activation k-tile for tiled_vec_dot_q4_0_gput_rs_64x1_c (rows * K up to 32 * HVX_GPUT_CORR_MAX)
+#define HVX_GPUT_CORR_MAX 768
+// activation rows that use the grouped fetch (2+ rows: two requests decoding together, a draft check): each fetched chunk is
+// used for every row, so the weight is read once; per row the same kernel calls as one row, so results are bit-identical
+#define HVX_GPUT_MAX_ROWS 4
 static HVX_Vector hvx_gput_corr[HTP_MAX_NTHREADS][HVX_GPUT_CORR_MAX] __attribute__((aligned(128)));
 
 static inline void hvx_gput_push(dma_queue * dq, uint8_t * slot, const uint8_t * q, const uint8_t * d, size_t gs,
@@ -790,6 +793,7 @@ struct hvx_gput_job {
     size_t          gs;
     uint32_t        ct_start, ct_end, n_rows;
     float *         out;
+    size_t          out_rs;                 // floats between the output rows of two activation rows
     uint32_t        kc, n_chunks, n_items;  // K chunk (k-tiles per fetch), chunks, fetch items
     uint32_t        grp;                    // column tiles per fetch group: HVX_GPUT_GROUP, or 1 for own
     uint32_t        own;                    // 1: this process's repacked copy (576-B tiles, tile_row_stride per column tile)
@@ -805,6 +809,7 @@ static inline void hvx_gput_job_init(struct hvx_gput_job * j, const struct htp_t
     j->ct_end   = ct_end;
     j->n_rows   = n_rows;
     j->out      = out;
+    j->out_rs   = 0;
     // the K chunk fills a slot for the group actually fetched: a thread with 2 column tiles (the 256-row K and V of the
     // attention) fetched 6 k-tiles at a time sized for 8 tiles - many small DMAs (2026-09-29, shared NX 2.4x own)
     const uint32_t gmax = MIN(HVX_GPUT_GROUP, ct_end - ct_start);
@@ -833,6 +838,7 @@ static inline void hvx_own_job_init(struct hvx_gput_job * j, const struct htp_te
     j->ct_end   = ct_end;
     j->n_rows   = n_rows;
     j->out      = out;
+    j->out_rs   = 0;
     j->kc       = nkt;
     j->n_chunks = 1;
     j->n_items  = ct_end - ct_start;
@@ -843,17 +849,17 @@ static inline void hvx_own_job_init(struct hvx_gput_job * j, const struct htp_te
 
 // The column tiles of several weights (the Q/K/V or gate/up of a MUL_MAT_NX) as ONE stream of fetch items, so the two
 // prefetch slots keep running across weight boundaries instead of refilling for every weight.
-// y = the quantized activation row; area = this thread's VTCM weight area (two slots); corr: this thread's
-// hvx_gput_corr row (NULL: the plain pair kernel).
-static void hvx_gput_gemv_jobs(dma_queue * dq, struct hvx_gput_job * jobs, uint32_t nj, const uint8_t * y, uint32_t nkt,
-                               uint8_t * area, uint32_t slot_bytes, HVX_Vector * corr) {
+// y = the quantized activation rows (ys bytes apart, nr rows); area = this thread's VTCM weight area (two slots); corr: this
+// thread's hvx_gput_corr row (NULL: the plain pair kernel).
+static void hvx_gput_gemv_jobs(dma_queue * dq, struct hvx_gput_job * jobs, uint32_t nj, const uint8_t * y, size_t ys, uint32_t nr,
+                               uint32_t nkt, uint8_t * area, uint32_t slot_bytes, HVX_Vector * corr) {
     uint32_t n_items = 0;
     for (uint32_t j = 0; j < nj; j++) n_items += jobs[j].n_items;
     if (n_items == 0) return;
     uint8_t * slots[HVX_GPUT_SLOTS];
     for (uint32_t i = 0; i < HVX_GPUT_SLOTS; i++) slots[i] = area + (size_t) i * slot_bytes;
-    if (corr && nkt <= HVX_GPUT_CORR_MAX) {
-        hvx_q8_corr_prep(nkt, y, corr);
+    if (corr && nr * nkt <= HVX_GPUT_CORR_MAX) {
+        for (uint32_t r = 0; r < nr; r++) hvx_q8_corr_prep(nkt, y + r * ys, corr + r * nkt);
     } else {
         corr = NULL;
     }
@@ -887,7 +893,9 @@ static void hvx_gput_gemv_jobs(dma_queue * dq, struct hvx_gput_job * jobs, uint3
         uint8_t * slot = (uint8_t *) dma_queue_pop(dq).dst;
         if (jb->own) {
             const int valid = MIN(32, MAX(0, (int) jb->n_rows - (int) (g0 * 32)));
-            tiled_vec_dot_q4_0_32x1(nkt * 32, jb->out + (size_t) (g0 - jb->ct_start) * 32, slot, y, valid, NULL);
+            for (uint32_t r = 0; r < nr; r++) {
+                tiled_vec_dot_q4_0_32x1(nkt * 32, jb->out + r * jb->out_rs + (size_t) (g0 - jb->ct_start) * 32, slot, y + r * ys, valid, NULL);
+            }
             if (i + HVX_GPUT_SLOTS < n_items) {
                 GPUT_ITEM(i + HVX_GPUT_SLOTS, j2, g2, gn2, c2, kn2);
                 GPUT_PUSH(slot, j2, g2, gn2, c2, kn2);
@@ -895,30 +903,32 @@ static void hvx_gput_gemv_jobs(dma_queue * dq, struct hvx_gput_job * jobs, uint3
             continue;
         }
         dma_queue_pop(dq);
-        uint32_t g = 0;
-        if ((gn & 1) == 0) {  // rows of gn * 64 B stay 128-B aligned: tiles in pairs
-            for (; g < gn; g += 2) {
-                const uint32_t ct = g0 + g;
-                const int      v0 = MIN(32, MAX(0, (int) jb->n_rows - (int) (ct * 32)));
-                const int      v1 = MIN(32, MAX(0, (int) jb->n_rows - (int) (ct * 32 + 32)));
-                float * o = jb->out + (size_t) (ct - jb->ct_start) * 32;
-                if (corr) {
-                    tiled_vec_dot_q4_0_gput_rs_64x1_c(kn, o, o + 32, slot + g * 64, slot + 512 * kn * gn + g * 64, gn * 64,
-                                                      y + (size_t) c0 * 1152, corr + c0, v0, v1, c0 == 0 ? NULL : o,
-                                                      (c0 == 0 || v1 == 0) ? NULL : o + 32);
-                } else {
-                    tiled_vec_dot_q4_0_gput_rs_64x1(kn, o, o + 32, slot + g * 64, slot + 512 * kn * gn + g * 64, gn * 64,
-                                                    y + (size_t) c0 * 1152, v0, v1, c0 == 0 ? NULL : o,
-                                                    (c0 == 0 || v1 == 0) ? NULL : o + 32);
+        for (uint32_t r = 0; r < nr; r++) {
+            const uint8_t * yr = y + r * ys + (size_t) c0 * 1152;
+            HVX_Vector *    cr = corr ? corr + r * nkt + c0 : NULL;
+            uint32_t g = 0;
+            if ((gn & 1) == 0) {  // rows of gn * 64 B stay 128-B aligned: tiles in pairs
+                for (; g < gn; g += 2) {
+                    const uint32_t ct = g0 + g;
+                    const int      v0 = MIN(32, MAX(0, (int) jb->n_rows - (int) (ct * 32)));
+                    const int      v1 = MIN(32, MAX(0, (int) jb->n_rows - (int) (ct * 32 + 32)));
+                    float * o = jb->out + r * jb->out_rs + (size_t) (ct - jb->ct_start) * 32;
+                    if (cr) {
+                        tiled_vec_dot_q4_0_gput_rs_64x1_c(kn, o, o + 32, slot + g * 64, slot + 512 * kn * gn + g * 64, gn * 64, yr, cr,
+                                                          v0, v1, c0 == 0 ? NULL : o, (c0 == 0 || v1 == 0) ? NULL : o + 32);
+                    } else {
+                        tiled_vec_dot_q4_0_gput_rs_64x1(kn, o, o + 32, slot + g * 64, slot + 512 * kn * gn + g * 64, gn * 64, yr, v0,
+                                                        v1, c0 == 0 ? NULL : o, (c0 == 0 || v1 == 0) ? NULL : o + 32);
+                    }
                 }
             }
-        }
-        for (; g < gn; g++) {
-            const uint32_t ct    = g0 + g;
-            const int      valid = MIN(32, MAX(0, (int) jb->n_rows - (int) (ct * 32)));
-            float * o = jb->out + (size_t) (ct - jb->ct_start) * 32;
-            tiled_vec_dot_q4_0_gput_rs_32x1(kn, o, slot + g * 64, slot + 512 * kn * gn + g * 64, gn * 64, y + (size_t) c0 * 1152,
-                                            valid, c0 == 0 ? NULL : o);
+            for (; g < gn; g++) {
+                const uint32_t ct    = g0 + g;
+                const int      valid = MIN(32, MAX(0, (int) jb->n_rows - (int) (ct * 32)));
+                float * o = jb->out + r * jb->out_rs + (size_t) (ct - jb->ct_start) * 32;
+                tiled_vec_dot_q4_0_gput_rs_32x1(kn, o, slot + g * 64, slot + 512 * kn * gn + g * 64, gn * 64, yr, valid,
+                                                c0 == 0 ? NULL : o);
+            }
         }
         if (i + HVX_GPUT_SLOTS < n_items) {
             GPUT_ITEM(i + HVX_GPUT_SLOTS, j2, g2, gn2, c2, kn2);
@@ -942,8 +952,9 @@ static void hvx_mv_2d_gput_q4_0(unsigned int nth, unsigned int ith, void * data)
 
     const uint32_t nkt        = ne10 / 32;
     const uint32_t slot_bytes = nkt * hex_align_up(576, 128);
+    const uint32_t nr         = ne11 * ne12 * ne13;
 
-    if (src0_start_row < src0_end_row && src2) {
+    if (src0_start_row < src0_end_row && src2 && nr == 1) {
         float * vtcm_src2_ptr = (float *) mmctx->vtcm_src2 + src0_start_row;
         const float * src2_ptr = (const float *) src2->data + src0_start_row;
         int slice_size = (int) MIN(src0_end_row, ne0) - (int) src0_start_row;
@@ -963,10 +974,25 @@ static void hvx_mv_2d_gput_q4_0(unsigned int nth, unsigned int ith, void * data)
     struct hvx_gput_job job;
     // two slots over the whole per-thread weight area (sized for n_prefetch >= 2 column tiles): bigger K chunks
     const uint32_t slot2 = MAX(slot_bytes, (mmctx->vtcm_src0_size_per_thread / 2) & ~127u);
-    hvx_gput_job_init(&job, src0, src0_start_row / 32, (src0_end_row + 31) / 32, ne0, tmp, nkt, slot2);
-    hvx_gput_gemv_jobs(dma_queue, &job, 1, mmctx->vtcm_src1, nkt, vtcm_src0_ptr, slot2, hvx_gput_corr[ith]);
-
     int copy_cnt = (int) MIN(src0_end_row, ne0) - (int) src0_start_row;
+    if (nr > 1) {
+        hvx_gput_job_init(&job, src0, src0_start_row / 32, (src0_end_row + 31) / 32, ne0, dst_col + src0_start_row, nkt, slot2);
+        job.out_rs = nb1 / sizeof(float);
+        hvx_gput_gemv_jobs(dma_queue, &job, 1, mmctx->vtcm_src1, mmctx->vtcm_src1_stride, nr, nkt, vtcm_src0_ptr, slot2,
+                           hvx_gput_corr[ith]);
+        if (src2 && copy_cnt > 0) {
+            const size_t src2_stride = (src2->ne[1] == 1) ? 0 : src2->nb[1];
+            for (uint32_t r = 0; r < nr; r++) {
+                float * o = (float *) ((uint8_t *) dst_col + r * nb1) + src0_start_row;
+                const float * b = (const float *) ((const uint8_t *) src2->data + r * src2_stride) + src0_start_row;
+                hvx_add_f32_uuu((uint8_t *) o, (const uint8_t *) o, (const uint8_t *) b, copy_cnt);
+            }
+        }
+        return;
+    }
+    hvx_gput_job_init(&job, src0, src0_start_row / 32, (src0_end_row + 31) / 32, ne0, tmp, nkt, slot2);
+    hvx_gput_gemv_jobs(dma_queue, &job, 1, mmctx->vtcm_src1, 0, 1, nkt, vtcm_src0_ptr, slot2, hvx_gput_corr[ith]);
+
     if (copy_cnt > 0) {
         if (src2) {
             hvx_add_f32_uaa((uint8_t *) &dst_col[src0_start_row], (const uint8_t *) tmp,
@@ -991,6 +1017,7 @@ static void hvx_mm_nx_gput_q4_0(unsigned int nth, unsigned int ith, void * data)
 
     hvx_mm_run_quant_task(mmctx, ith);
 
+    const uint32_t nr = act->ne[1] * act->ne[2] * act->ne[3];
     struct hvx_gput_job jobs[HTP_OP_MAX_INPUTS];
     uint32_t nj = 0;
     for (uint32_t widx = 0; widx < n_weights && nj < HTP_OP_MAX_INPUTS; widx++) {
@@ -1005,13 +1032,15 @@ static void hvx_mm_nx_gput_q4_0(unsigned int nth, unsigned int ith, void * data)
         const uint32_t end_row   = MIN(start_row + per_thread, src0_nrows);
         if (start_row >= end_row) continue;
         if (src_w->flags & HTP_TENSOR_GPUT) {
-            hvx_gput_job_init(&jobs[nj++], src_w, start_row / 32, (end_row + 31) / 32, ne01, (float *) dst->data + start_row,
+            hvx_gput_job_init(&jobs[nj], src_w, start_row / 32, (end_row + 31) / 32, ne01, (float *) dst->data + start_row,
                               nkt, slot_bytes);
         } else {
-            hvx_own_job_init(&jobs[nj++], src_w, start_row / 32, (end_row + 31) / 32, ne01, (float *) dst->data + start_row, nkt);
+            hvx_own_job_init(&jobs[nj], src_w, start_row / 32, (end_row + 31) / 32, ne01, (float *) dst->data + start_row, nkt);
         }
+        jobs[nj++].out_rs = dst->nb[1] / sizeof(float);
     }
-    hvx_gput_gemv_jobs(dma_queue, jobs, nj, mmctx->vtcm_src1, nkt, vtcm_weight_ptr, slot_bytes, hvx_gput_corr[ith]);
+    hvx_gput_gemv_jobs(dma_queue, jobs, nj, mmctx->vtcm_src1, mmctx->vtcm_src1_stride, nr, nkt, vtcm_weight_ptr, slot_bytes,
+                       hvx_gput_corr[ith]);
 }
 
 static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
@@ -1668,7 +1697,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;  // no OpenCL-layout fetch for this kernel
     }
 
-    if ((src0->flags & HTP_TENSOR_GPUT) && src1_nrows == 1) {
+    if ((src0->flags & HTP_TENSOR_GPUT) && src1_nrows <= HVX_GPUT_MAX_ROWS) {
         matmul_job_func = hvx_mv_2d_gput_q4_0;  // decode: grouped fetch (hvx_gput_gemv_jobs)
     }
 
@@ -4657,7 +4686,7 @@ int op_matmul_nx(struct htp_ops_context * octx) {
         matmul_job_func = hvx_mm_nx_2d;
     }
 
-    if (src1_nrows == 1 && matmul_job_func == hvx_mm_nx_2d_repacked_q4_0) {
+    if (src1_nrows <= HVX_GPUT_MAX_ROWS && matmul_job_func == hvx_mm_nx_2d_repacked_q4_0) {
         // any shared weight: the whole NX as one fetch stream (hvx_gput_gemv_jobs), own-copy weights included as long as
         // their K is the activation's (one repacked column tile = one slot)
         bool any_gput = false, own_ok = true;
