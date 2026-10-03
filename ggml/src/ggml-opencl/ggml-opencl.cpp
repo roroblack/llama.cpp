@@ -8989,8 +8989,9 @@ static cl_mem ggml_cl_alloc_dmabuf(cl_context context, size_t size, ggml_cl_dmab
 // GGML_OPENCL_SHARE_SOCK=<path> (turns on GGML_OPENCL_DMABUF): a client on that unix socket gets the dma-buf fds of the
 // device buffers (SCM_RIGHTS) and one line per Q4_0 weight - where its scales (d) and quants (q) sit and in which layout -
 // so that the Hexagon backend in another process can use this copy of the weights instead of its own.
-// Line: "<fd index> <name> <ne0> <ne1> <ne2> <d offset> <q offset> <layout>"; layout 1 = quants unshuffled and both q and d
-// transposed as 16-bit words (use_adreno_kernels), 0 = anything else.
+// Line: "<fd index> <name> <ne0> <ne1> <ne2> <d offset> <q offset> <layout>"; layout 1 = Q4_0, quants unshuffled and both q
+// and d transposed as 16-bit words (use_adreno_kernels), 0 = any other Q4_0, 2 = Q8_0 not transposed: q = [ne1][ne0] int8,
+// d = [ne1][ne0/32] fp16 (the output layer, over the 2^27 elements enable_adreno_trans_weight transposes).
 struct ggml_cl_share_entry {
     std::string name;
     int64_t     ne0, ne1, ne2;
@@ -10469,6 +10470,9 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             extra_orig->data_device, CL_MEM_READ_WRITE,
             CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         CL_CHECK(err);
+        const size_t q8_d_origin = previous_origin;
+        const size_t q8_q_origin = region.origin;
+        GGML_UNUSED(q8_d_origin); GGML_UNUSED(q8_q_origin);
 
         cl_kernel kernel = backend_ctx->kernel_convert_block_q8_0;
 
@@ -10531,6 +10535,17 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, K/32, M);
         } // end transpose
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+
+        bool q8_transposed = false;
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        q8_transposed = enable_adreno_trans_weight(backend_ctx, tensor);
+#endif
+        if (ggml_cl_share_sock() && ctx->dmabuf.fd >= 0 && extra_orig->data_device == ctx->buffer[0] && !q8_transposed &&
+            tensor->ne[2] == 1 && tensor->ne[3] == 1) {
+            clFinish(queue);
+            ggml_cl_share_add({ tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], ctx->dmabuf.fd, q8_d_origin,
+                                q8_q_origin, 2 });
+        }
 
         return;
     }

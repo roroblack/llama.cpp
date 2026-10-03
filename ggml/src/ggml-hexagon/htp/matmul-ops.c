@@ -3755,8 +3755,270 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     return HTP_STATUS_OK;
 }
 
+// ---- HTP_TENSOR_GPUT Q8_0: the GPU server's copy of a Q8_0 weight it does not transpose (the output layer: over 2^27
+// elements). OpenCL SOA layout: q = [M][K] int8 at data, d = [M][K/32] fp16 at data + (int32) reserved. ----
+// 32 rows at a time with lane = row, so each output equals tiled_vec_dot_q8_0_32x1 on our own repacked copy (same int
+// sums, same f16 x f16 -> f32 scale, same f32 accumulation order over k-tiles; hexagon-sim 0/32 lanes differ, 2026-10-03):
+//  - per 128-k piece v: vrmpy of the 32 rows' pieces with the activation piece; a deal-add tree over row bits 0..2 sums the
+//    8 partial lanes of each k-tile (lane 4*(r&7) + k-tile), two deal stages over row bits 3..4 give one vector per k-tile
+//    with lane = row;
+//  - the 32 rows' scales (fetched with a 128 B row stride) are transposed by 5 halfword deal stages: vector c holds k-tile c
+//    in its even halfwords and k-tile c+32 in its odd ones, so one Q6_Wqf32_vmpy_VhfVhf with the activation scale pair gives
+//    both k-tiles' scales in natural row order.
+// The activation is quantized by the tiled quantizer of our own q8_0 path (same bytes), then unpacked to K plain int8 and
+// the scale pairs. hexagon-sim: 3,038 cycles per 32 rows of K = 1536 (63 per 32x32 block).
+
+#define GQ8_MAX_NKT 64  // K <= 2048: one 128 B row of scales per weight row
+
+static inline HVX_Vector gq8_deal_add(HVX_Vector hi, HVX_Vector lo) {
+    const HVX_VectorPair p = Q6_W_vdeal_VVR(hi, lo, -4);
+    return Q6_Vw_vadd_VwVw(Q6_V_lo_W(p), Q6_V_hi_W(p));
+}
+
+#define GQ8_DEAL2(A, B)                                                   \
+    do {                                                                  \
+        const HVX_VectorPair p_ = Q6_W_vdeal_VVR(B, A, -2);               \
+        A = Q6_V_lo_W(p_);                                                \
+        B = Q6_V_hi_W(p_);                                                \
+    } while (0)
+
+// 32 rows of scales (row stride 128 B) -> t[c]: even halfwords = k-tile c of rows 0..31, odd = k-tile c + 32
+static void gq8_scales_transpose(const HVX_Vector * restrict d, HVX_Vector * restrict t) {
+    HVX_Vector t0 = d[0], t1 = d[1], t2 = d[2], t3 = d[3], t4 = d[4], t5 = d[5], t6 = d[6], t7 = d[7];
+    HVX_Vector t8 = d[8], t9 = d[9], t10 = d[10], t11 = d[11], t12 = d[12], t13 = d[13], t14 = d[14], t15 = d[15];
+    HVX_Vector t16 = d[16], t17 = d[17], t18 = d[18], t19 = d[19], t20 = d[20], t21 = d[21], t22 = d[22], t23 = d[23];
+    HVX_Vector t24 = d[24], t25 = d[25], t26 = d[26], t27 = d[27], t28 = d[28], t29 = d[29], t30 = d[30], t31 = d[31];
+    GQ8_DEAL2(t0, t1); GQ8_DEAL2(t2, t3); GQ8_DEAL2(t4, t5); GQ8_DEAL2(t6, t7);
+    GQ8_DEAL2(t8, t9); GQ8_DEAL2(t10, t11); GQ8_DEAL2(t12, t13); GQ8_DEAL2(t14, t15);
+    GQ8_DEAL2(t16, t17); GQ8_DEAL2(t18, t19); GQ8_DEAL2(t20, t21); GQ8_DEAL2(t22, t23);
+    GQ8_DEAL2(t24, t25); GQ8_DEAL2(t26, t27); GQ8_DEAL2(t28, t29); GQ8_DEAL2(t30, t31);
+    GQ8_DEAL2(t0, t2); GQ8_DEAL2(t1, t3); GQ8_DEAL2(t4, t6); GQ8_DEAL2(t5, t7);
+    GQ8_DEAL2(t8, t10); GQ8_DEAL2(t9, t11); GQ8_DEAL2(t12, t14); GQ8_DEAL2(t13, t15);
+    GQ8_DEAL2(t16, t18); GQ8_DEAL2(t17, t19); GQ8_DEAL2(t20, t22); GQ8_DEAL2(t21, t23);
+    GQ8_DEAL2(t24, t26); GQ8_DEAL2(t25, t27); GQ8_DEAL2(t28, t30); GQ8_DEAL2(t29, t31);
+    GQ8_DEAL2(t0, t4); GQ8_DEAL2(t1, t5); GQ8_DEAL2(t2, t6); GQ8_DEAL2(t3, t7);
+    GQ8_DEAL2(t8, t12); GQ8_DEAL2(t9, t13); GQ8_DEAL2(t10, t14); GQ8_DEAL2(t11, t15);
+    GQ8_DEAL2(t16, t20); GQ8_DEAL2(t17, t21); GQ8_DEAL2(t18, t22); GQ8_DEAL2(t19, t23);
+    GQ8_DEAL2(t24, t28); GQ8_DEAL2(t25, t29); GQ8_DEAL2(t26, t30); GQ8_DEAL2(t27, t31);
+    GQ8_DEAL2(t0, t8); GQ8_DEAL2(t1, t9); GQ8_DEAL2(t2, t10); GQ8_DEAL2(t3, t11);
+    GQ8_DEAL2(t4, t12); GQ8_DEAL2(t5, t13); GQ8_DEAL2(t6, t14); GQ8_DEAL2(t7, t15);
+    GQ8_DEAL2(t16, t24); GQ8_DEAL2(t17, t25); GQ8_DEAL2(t18, t26); GQ8_DEAL2(t19, t27);
+    GQ8_DEAL2(t20, t28); GQ8_DEAL2(t21, t29); GQ8_DEAL2(t22, t30); GQ8_DEAL2(t23, t31);
+    GQ8_DEAL2(t0, t16); GQ8_DEAL2(t1, t17); GQ8_DEAL2(t2, t18); GQ8_DEAL2(t3, t19);
+    GQ8_DEAL2(t4, t20); GQ8_DEAL2(t5, t21); GQ8_DEAL2(t6, t22); GQ8_DEAL2(t7, t23);
+    GQ8_DEAL2(t8, t24); GQ8_DEAL2(t9, t25); GQ8_DEAL2(t10, t26); GQ8_DEAL2(t11, t27);
+    GQ8_DEAL2(t12, t28); GQ8_DEAL2(t13, t29); GQ8_DEAL2(t14, t30); GQ8_DEAL2(t15, t31);
+    t[0] = t0; t[1] = t1; t[2] = t2; t[3] = t3; t[4] = t4; t[5] = t5; t[6] = t6; t[7] = t7;
+    t[8] = t8; t[9] = t9; t[10] = t10; t[11] = t11; t[12] = t12; t[13] = t13; t[14] = t14; t[15] = t15;
+    t[16] = t16; t[17] = t17; t[18] = t18; t[19] = t19; t[20] = t20; t[21] = t21; t[22] = t22; t[23] = t23;
+    t[24] = t24; t[25] = t25; t[26] = t26; t[27] = t27; t[28] = t28; t[29] = t29; t[30] = t30; t[31] = t31;
+}
+#undef GQ8_DEAL2
+
+#define GQ8_GROUP(G, OUT)                                                                                         \
+    do {                                                                                                          \
+        const uint8_t * restrict qg_ = q + (size_t) ((G) * 8) * K + v * 128;                                      \
+        const HVX_Vector p0_ = Q6_Vw_vrmpy_VbVb(*(const HVX_Vector *) (qg_ + 0 * K), a);                          \
+        const HVX_Vector p1_ = Q6_Vw_vrmpy_VbVb(*(const HVX_Vector *) (qg_ + 1 * K), a);                          \
+        const HVX_Vector p2_ = Q6_Vw_vrmpy_VbVb(*(const HVX_Vector *) (qg_ + 2 * K), a);                          \
+        const HVX_Vector p3_ = Q6_Vw_vrmpy_VbVb(*(const HVX_Vector *) (qg_ + 3 * K), a);                          \
+        const HVX_Vector p4_ = Q6_Vw_vrmpy_VbVb(*(const HVX_Vector *) (qg_ + 4 * K), a);                          \
+        const HVX_Vector p5_ = Q6_Vw_vrmpy_VbVb(*(const HVX_Vector *) (qg_ + 5 * K), a);                          \
+        const HVX_Vector p6_ = Q6_Vw_vrmpy_VbVb(*(const HVX_Vector *) (qg_ + 6 * K), a);                          \
+        const HVX_Vector p7_ = Q6_Vw_vrmpy_VbVb(*(const HVX_Vector *) (qg_ + 7 * K), a);                          \
+        OUT = gq8_deal_add(gq8_deal_add(gq8_deal_add(p7_, p6_), gq8_deal_add(p5_, p4_)),                          \
+                           gq8_deal_add(gq8_deal_add(p3_, p2_), gq8_deal_add(p1_, p0_)));                         \
+    } while (0)
+
+// 32 rows (q: row stride K, 128-aligned) x one activation (y: K int8) with the scales sc[k-tile] (lane = row) -> out
+static void gq8_tile_dot(const uint8_t * restrict q, uint32_t K, const int8_t * restrict y, const HVX_Vector * restrict sc,
+                         float * restrict out, uint32_t valid) {
+    HVX_Vector acc = Q6_V_vzero();
+    const HVX_Vector * restrict yv = (const HVX_Vector *) y;
+    for (uint32_t v = 0; v < K / 128; v++) {
+        const HVX_Vector a = yv[v];
+        HVX_Vector x0, x1, x2, x3;
+        GQ8_GROUP(0, x0);
+        GQ8_GROUP(1, x1);
+        GQ8_GROUP(2, x2);
+        GQ8_GROUP(3, x3);
+        const HVX_VectorPair d01 = Q6_W_vdeal_VVR(x1, x0, -4), d23 = Q6_W_vdeal_VVR(x3, x2, -4);
+        const HVX_VectorPair e0  = Q6_W_vdeal_VVR(Q6_V_lo_W(d23), Q6_V_lo_W(d01), -4);
+        const HVX_VectorPair e1  = Q6_W_vdeal_VVR(Q6_V_hi_W(d23), Q6_V_hi_W(d01), -4);
+        HVX_Vector m0 = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(Q6_V_lo_W(e0)), sc[v * 4 + 0]);
+        HVX_Vector m1 = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(Q6_V_lo_W(e1)), sc[v * 4 + 1]);
+        HVX_Vector m2 = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(Q6_V_hi_W(e0)), sc[v * 4 + 2]);
+        HVX_Vector m3 = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(Q6_V_hi_W(e1)), sc[v * 4 + 3]);
+        __asm__ volatile("" : "+v"(m0), "+v"(m1), "+v"(m2), "+v"(m3));
+        acc = hvx_vec_add_f32_f32(acc, m0);
+        __asm__ volatile("" : "+v"(acc));
+        acc = hvx_vec_add_f32_f32(acc, m1);
+        __asm__ volatile("" : "+v"(acc));
+        acc = hvx_vec_add_f32_f32(acc, m2);
+        __asm__ volatile("" : "+v"(acc));
+        acc = hvx_vec_add_f32_f32(acc, m3);
+        __asm__ volatile("" : "+v"(acc));
+    }
+    hvx_vec_store_u(out, valid * sizeof(float), acc);
+}
+#undef GQ8_GROUP
+
+struct gq8_context {
+    struct htp_ops_context * octx;
+    uint32_t row0;          // first activation row of this batch
+    const uint8_t * q;      // weight quants (GPU layout)
+    const uint8_t * d;      // weight scales
+    uint32_t K, nkt, M, n_act;
+    uint8_t * act_t;        // tiled q8_0 activation rows (quantize_f32_q8_0_tiled)
+    size_t act_t_row;
+    uint8_t * act_f;        // per row: K plain int8, then 32 scale-pair vectors
+    size_t act_f_row;
+    uint8_t * area;         // per thread: 2 slots + 32 transposed scale vectors + nkt scale vectors
+    size_t area_per_thread, slot_bytes;
+    uint32_t tiles_per_thread;
+};
+
+// activation rows ith, ith + nth, ...: tiled -> plain int8 + scale pairs (halfword 2c+0 = k-tile c, 2c+1 = k-tile c + 32)
+static void gq8_act_unpack(unsigned int nth, unsigned int ith, void * data) {
+    struct gq8_context * g = data;
+    for (uint32_t j = ith; j < g->n_act; j += nth) {
+        const uint8_t * restrict t = g->act_t + j * g->act_t_row;
+        uint8_t * restrict f = g->act_f + j * g->act_f_row;
+        __fp16 da[GQ8_MAX_NKT + 32];
+        for (uint32_t kt = 0; kt < g->nkt; kt++) {
+            const HVX_Vector * restrict a = (const HVX_Vector *) (t + kt * 1152);
+            HVX_Vector w = a[0];
+            for (int i = 1; i < 8; i++) w = Q6_V_vmux_QVV(Q6_Q_vsetq_R(4 * i), w, a[i]);  // bytes 4i.. from a[i]
+            hvx_vec_store_u(f + kt * 32, 32, w);
+            da[kt] = ((const __fp16 *) (t + kt * 1152 + 8 * 128))[0];
+        }
+        for (uint32_t kt = g->nkt; kt < 64; kt++) da[kt] = (__fp16) 0;
+        HVX_Vector * restrict ap = (HVX_Vector *) (f + hex_round_up(g->K, 128));
+        for (uint32_t c = 0; c < 32; c++) {
+            union { __fp16 h[2]; uint32_t w; } u;
+            u.h[0] = da[c];
+            u.h[1] = da[c + 32];
+            ap[c] = Q6_V_vsplat_R((int32_t) u.w);
+        }
+    }
+}
+
+static void gq8_job(unsigned int nth, unsigned int ith, void * data) {
+    struct gq8_context * g = data;
+    struct htp_ops_context * octx = g->octx;
+    const struct htp_tensor * dst = octx->dst;
+    const uint32_t ntiles = g->M / 32;
+    const uint32_t t0 = g->tiles_per_thread * ith, t1 = MIN(t0 + g->tiles_per_thread, ntiles);
+    if (t0 >= t1) return;
+    dma_queue * dq = octx->ctx->dma[ith];
+    uint8_t * area = g->area + g->area_per_thread * ith;
+    uint8_t * slots[2] = { area, area + g->slot_bytes };
+    HVX_Vector * tsc = (HVX_Vector *) (area + 2 * g->slot_bytes);  // 32 transposed scale vectors
+    HVX_Vector * sc  = tsc + 32;                                    // nkt scale vectors (lane = row)
+    const uint32_t K = g->K, kd = g->nkt * 2;
+    const size_t qb = (size_t) 32 * K;
+
+#define GQ8_PUSH(SLOT, T)                                                                                          \
+    do {                                                                                                           \
+        dma_queue_push(dq, dma_make_ptr((SLOT), g->q + (size_t) (T) * qb), K, K, K, 32);                           \
+        dma_queue_push(dq, dma_make_ptr((SLOT) + qb, g->d + (size_t) (T) * 32 * kd), 128, kd, kd, 32);           \
+    } while (0)
+
+    for (uint32_t i = 0; i < 2 && t0 + i < t1; i++) GQ8_PUSH(slots[i], t0 + i);
+    for (uint32_t t = t0; t < t1; t++) {
+        uint8_t * slot = (uint8_t *) dma_queue_pop(dq).dst;
+        dma_queue_pop(dq);
+        gq8_scales_transpose((const HVX_Vector *) (slot + qb), tsc);
+        for (uint32_t j = 0; j < g->n_act; j++) {
+            const uint8_t * f = g->act_f + j * g->act_f_row;
+            const HVX_Vector * ap = (const HVX_Vector *) (f + hex_round_up(K, 128));
+            for (uint32_t c = 0; c < 32 && c < g->nkt; c++) {
+                const HVX_VectorPair p = Q6_Wqf32_vmpy_VhfVhf(tsc[c], ap[c]);
+                sc[c] = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(p));
+                if (c + 32 < g->nkt) sc[c + 32] = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(p));
+            }
+            float * out = (float *) ((uint8_t *) dst->data + (size_t) (g->row0 + j) * dst->nb[1]) + (size_t) t * 32;
+            gq8_tile_dot(slot, K, (const int8_t *) f, sc, out, 32);
+        }
+        if (t + 2 < t1) GQ8_PUSH(slot, t + 2);
+    }
+#undef GQ8_PUSH
+    dma_queue_flush(dq);
+}
+
+static int hvx_mm_gput_q8_0(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+    const uint32_t K = src0->ne[0], M = src0->ne[1];
+    const uint32_t n_act = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    if (src1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 || src1->ne[0] != K || K % 128 != 0 || K / 32 > GQ8_MAX_NKT ||
+        M % 32 != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 || dst->ne[0] != M || dst->nb[1] % 128 != 0 ||
+        src1->ne[2] * src1->ne[3] != 1 || dst->ne[1] != n_act || n_act == 0) {
+        FARF(ERROR, "gput-q8_0: unsupported shape %ux%u x %ux%u", K, M, src1->ne[0], n_act);
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
+    }
+    const uint32_t nth = octx->n_threads;
+    // activation rows in batches: a quantized row takes K/32 * 1152 B of VTCM (55 KB for K = 1536); the weight is fetched
+    // again for every batch (only the all-logits case, e.g. perplexity, has more than one row)
+    const uint32_t nb = MIN(n_act, 16);
+
+    struct gq8_context g = { 0 };
+    g.octx      = octx;
+    g.q         = (const uint8_t *) src0->data;
+    g.d         = (const uint8_t *) src0->data + (int32_t) src0->reserved;
+    g.K         = K;
+    g.nkt       = K / 32;
+    g.M         = M;
+    g.act_t_row = htp_mm_q8_0_tiled_row_size(K);
+    g.act_f_row = hex_round_up(K, 128) + 32 * 128;
+    g.slot_bytes      = (size_t) 32 * K + 32 * 128;
+    g.area_per_thread = 2 * g.slot_bytes + (32 + GQ8_MAX_NKT) * 128;
+    g.tiles_per_thread = (M / 32 + nth - 1) / nth;
+
+    const size_t tmp_per_thread = hex_round_up(K * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+    uint8_t * cur = octx->ctx->vtcm_base;
+    g.act_t = vtcm_seq_alloc(&cur, g.act_t_row * nb);
+    g.act_f = vtcm_seq_alloc(&cur, g.act_f_row * nb);
+    uint8_t * tmp = vtcm_seq_alloc(&cur, tmp_per_thread * nth);
+    g.area  = vtcm_seq_alloc(&cur, g.area_per_thread * nth);
+    if ((size_t) (cur - octx->ctx->vtcm_base) > octx->ctx->vtcm_size) {
+        FARF(ERROR, "gput-q8_0: VTCM %zu needed > %zu", (size_t) (cur - octx->ctx->vtcm_base), octx->ctx->vtcm_size);
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    for (uint32_t r0 = 0; r0 < n_act; r0 += nb) {
+        const uint32_t n = MIN(nb, n_act - r0);
+        struct htp_tensor act = *src1;  // this batch of rows for the quantizer
+        act.data  = src1->data + r0 * src1->nb[1];
+        act.ne[1] = n;
+
+        struct htp_mm_context mm = { 0 };
+        mm.octx                     = octx;
+        mm.act                      = &act;
+        mm.n_quant_rows_per_thread  = (n + nth - 1) / nth;
+        mm.vtcm_src1                = (uint8_t *) g.act_t;
+        mm.vtcm_dst                 = tmp;
+        mm.vtcm_dst_size_per_thread = tmp_per_thread;
+
+        g.row0  = r0;
+        g.n_act = n;
+        worker_pool_run_func(octx->ctx->worker_pool, quantize_f32_q8_0_tiled, &mm, MIN(nth, n));
+        worker_pool_run_func(octx->ctx->worker_pool, gq8_act_unpack, &g, MIN(nth, n));
+        worker_pool_run_func(octx->ctx->worker_pool, gq8_job, &g, nth);
+    }
+    return HTP_STATUS_OK;
+}
+
 int op_matmul(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+
+    if ((octx->src[0]->flags & HTP_TENSOR_GPUT) && octx->src[0]->type == HTP_TYPE_Q8_0) {
+        return hvx_mm_gput_q8_0(octx);  // the GPU server's layout: neither the HMX nor the repacked HVX kernels read it
+    }
 
     if (kparams->n_hmx) {
         return hmx_mm_op_matmul(octx, kparams);

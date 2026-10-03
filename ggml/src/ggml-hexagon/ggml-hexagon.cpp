@@ -302,7 +302,7 @@ enum ggml_hexagon_tensor_flags {
     GGML_HEXAGON_TENSOR_WEIGHT    = (1 << 1),
     GGML_HEXAGON_TENSOR_FENCE     = (1 << 2),
     GGML_HEXAGON_TENSOR_FUSEABLE  = (1 << 3),
-    GGML_HEXAGON_TENSOR_SHARED    = (1 << 4),  // Q4_0 weight read from the GPU server's copy (GGML_HEXAGON_SHARED_WEIGHTS)
+    GGML_HEXAGON_TENSOR_SHARED    = (1 << 4),  // Q4_0 / Q8_0 weight read from the GPU server's copy (GGML_HEXAGON_SHARED_WEIGHTS)
 };
 
 static inline bool ggml_hexagon_is_repack_type(enum ggml_type type) {
@@ -712,10 +712,13 @@ struct ggml_hexagon_shared_buffer {
 // its dma-buf instead of a repacked copy of our own. Such a tensor asks for 128 bytes only (a unique address: tensors are
 // matched by data pointer and shape when a batch is built), is never written, and goes to the NPU as a repacked Q4_0
 // with HTP_TENSOR_GPUT: the NPU fetches its tiles from the GPU layout (q at data, d at reserved) and compute is unchanged.
+// Layout 2 = a Q8_0 weight the GPU keeps untransposed (its output layer): q = [M][K] int8, d = [M][K/32] fp16, read by
+// hvx_mm_gput_q8_0 (K a multiple of 128 and at most 2048, M a multiple of 32).
 struct ggml_hexagon_wshare_entry {
-    int      fi;
-    int64_t  ne0, ne1, ne2;
-    uint32_t d_off, q_off;
+    int       fi;
+    int64_t   ne0, ne1, ne2;
+    uint32_t  d_off, q_off;
+    ggml_type type;
 };
 
 struct ggml_hexagon_wshare {
@@ -794,9 +797,11 @@ static ggml_hexagon_wshare & ggml_hexagon_wshare_get() {
             size_t d = 0, q = 0;
             int layout = 0;
             if (!(l >> e.fi >> name >> e.ne0 >> e.ne1 >> e.ne2 >> d >> q >> layout)) continue;
-            if (layout != 1 || e.fi < 0 || e.fi >= (int) ws.mem.size()) continue;
+            if ((layout != 1 && layout != 2) || e.fi < 0 || e.fi >= (int) ws.mem.size()) continue;
             if (e.ne0 % 32 != 0 || e.ne1 % 32 != 0 || e.ne2 != 1) continue;
-            const size_t nq = (size_t) e.ne0 * e.ne1 / 2, nd = (size_t) e.ne0 / 32 * e.ne1 * 2;
+            if (layout == 2 && (e.ne0 % 128 != 0 || e.ne0 / 32 > 64)) continue;
+            e.type = layout == 2 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_0;
+            const size_t nq = (size_t) e.ne0 * e.ne1 / (layout == 2 ? 1 : 2), nd = (size_t) e.ne0 / 32 * e.ne1 * 2;
             if (q + nq > ws.mem[e.fi]->size || d + nd > ws.mem[e.fi]->size || q > UINT32_MAX || d > UINT32_MAX) continue;
             e.d_off = (uint32_t) d;
             e.q_off = (uint32_t) q;
@@ -804,8 +809,10 @@ static ggml_hexagon_wshare & ggml_hexagon_wshare_get() {
             bytes += nq + nd;
         }
         ws.loaded = !ws.map.empty();
-        GGML_LOG_INFO("ggml-hex: shared weights: %zu Q4_0 tensors (%.1f MiB) from %s in %zu dma-bufs\n", ws.map.size(),
-                      bytes / 1048576.0, path, ws.mem.size());
+        size_t n_q8 = 0;
+        for (const auto & kv : ws.map) n_q8 += kv.second.type == GGML_TYPE_Q8_0;
+        GGML_LOG_INFO("ggml-hex: shared weights: %zu Q4_0 + %zu Q8_0 tensors (%.1f MiB) from %s in %zu dma-bufs\n",
+                      ws.map.size() - n_q8, n_q8, bytes / 1048576.0, path, ws.mem.size());
 #endif
     });
     return ws;
@@ -819,13 +826,13 @@ ggml_hexagon_shared_buffer * ggml_hexagon_session::wshare_buf(int fi) {
 }
 
 static const ggml_hexagon_wshare_entry * ggml_hexagon_wshare_find(const ggml_tensor * t) {
-    if (t->type != GGML_TYPE_Q4_0 || t->ne[3] != 1) return nullptr;
+    if ((t->type != GGML_TYPE_Q4_0 && t->type != GGML_TYPE_Q8_0) || t->ne[3] != 1) return nullptr;
     auto & ws = ggml_hexagon_wshare_get();
     if (!ws.loaded) return nullptr;
     auto it = ws.map.find(t->name);
     if (it == ws.map.end()) return nullptr;
     const auto & e = it->second;
-    if (e.ne0 != t->ne[0] || e.ne1 != t->ne[1] || e.ne2 != t->ne[2]) return nullptr;
+    if (e.type != t->type || e.ne0 != t->ne[0] || e.ne1 != t->ne[1] || e.ne2 != t->ne[2]) return nullptr;
     return &e;
 }
 
@@ -2021,11 +2028,12 @@ struct ggml_hexagon_opbatch {
         }
 
         if ((extra->flags & GGML_HEXAGON_TENSOR_SHARED) != 0) {
-            // GPU layout 1: q = [K/4][M] 16-bit words at data, d = [K/32][M] fp16 at data + (int32) reserved
+            // GPU layout 1 (Q4_0): q = [K/4][M] 16-bit words at data, d = [K/32][M] fp16 at data + (int32) reserved;
+            // layout 2 (Q8_0): q = [M][K] int8, d = [M][K/32] fp16
             h.bi       = add_buffer(sess->wshare_buf(extra->ws_fi));
             h.data     = extra->ws_q;
             h.reserved = (uint32_t) ((int64_t) extra->ws_d - (int64_t) extra->ws_q);  // the NPU rebases data only
-            h.size     = (uint32_t) (t->ne[0] * t->ne[1] / 2);
+            h.size     = (uint32_t) (t->ne[0] * t->ne[1] / (t->type == GGML_TYPE_Q8_0 ? 1 : 2));
             t_size     = h.size;
         }
 
