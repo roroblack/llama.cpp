@@ -591,6 +591,85 @@ static void tiled_vec_dot_q4_0_gput_rs_64x1(uint32_t kn, float * restrict out0, 
     }
 }
 
+// Decode GEMV on the OpenCL layout, faster form of tiled_vec_dot_q4_0_gput_rs_64x1 with the same output bits.
+// One HVX thread issues about one packet per 3 cycles whatever the packet holds (hexagon-sim v73: 8 independent adds in
+// 2 packets = 6 cycles, 8 dependent adds in 8 packets = 24), so the lever is fewer packets:
+//  - the nibbles go to vrmpy unsigned (ub x b) and 8 * sum(a) of the k-tile is subtracted once (corr, from
+//    hvx_q8_corr_prep, shared by every column tile of the GEMV) instead of "- 8" on every weight byte;
+//  - one f16 multiply gives the scales of both tiles (the activation scale is the same in all lanes);
+//  - four k-tiles per step give the scheduler independent work; the f32 accumulation still goes one k-tile after the
+//    other, and an empty asm on each sf value stops the compiler from folding the qf32 -> sf roundings away (it did,
+//    128 ulp off). hexagon-sim: 63.4 -> 57.2 cycles per (column tile x k-tile), 0/256 outputs differ (2026-09-29).
+static void hvx_q8_corr_prep(uint32_t nkt, const uint8_t * restrict y_q, HVX_Vector * restrict corr) {
+    const HVX_Vector ones = Q6_Vb_vsplat_R(1);
+    for (uint32_t kt = 0; kt < nkt; kt++) {
+        const HVX_Vector * restrict a = (const HVX_Vector *) (y_q + kt * 1152);
+        HVX_Vector s = Q6_V_vzero();
+#pragma unroll
+        for (int i = 0; i < 8; i++) s = Q6_Vw_vrmpyacc_VwVbVb(s, a[i], ones);
+        corr[kt] = Q6_Vw_vasl_VwR(s, 3);
+    }
+}
+
+#define GPUT_C_KT(KT, SA, SB)                                                                                        \
+    do {                                                                                                             \
+        const uint8_t * restrict qk_ = q + (size_t) (KT) * 8 * rs;                                                   \
+        const HVX_Vector * restrict ya_ = (const HVX_Vector *) (y_q + (KT) * 1152);                                  \
+        HVX_Vector a0_ = Q6_V_vzero(), a1_ = Q6_V_vzero(), b0_ = Q6_V_vzero(), b1_ = Q6_V_vzero();                   \
+        _Pragma("unroll") for (int i_ = 0; i_ < 4; i_++) {                                                           \
+            const HVX_VectorPair t_  = Q6_W_vshuff_VVR(*(const HVX_Vector *) (qk_ + (2 * i_ + 1) * rs),             \
+                                                       *(const HVX_Vector *) (qk_ + (2 * i_) * rs), -64);            \
+            const HVX_VectorPair w0_ = unpack_4bit_gput_x2(Q6_V_lo_W(t_), mask_h4);                                  \
+            const HVX_VectorPair w1_ = unpack_4bit_gput_x2(Q6_V_hi_W(t_), mask_h4);                                  \
+            a0_ = Q6_Vw_vrmpyacc_VwVubVb(a0_, Q6_V_lo_W(w0_), ya_[i_ * 2 + 0]);                                       \
+            a1_ = Q6_Vw_vrmpyacc_VwVubVb(a1_, Q6_V_hi_W(w0_), ya_[i_ * 2 + 1]);                                       \
+            b0_ = Q6_Vw_vrmpyacc_VwVubVb(b0_, Q6_V_lo_W(w1_), ya_[i_ * 2 + 0]);                                       \
+            b1_ = Q6_Vw_vrmpyacc_VwVubVb(b1_, Q6_V_hi_W(w1_), ya_[i_ * 2 + 1]);                                       \
+        }                                                                                                            \
+        const HVX_Vector c_ = corr[KT];                                                                              \
+        HVX_VectorPair p_ = Q6_Wqf32_vmpy_VhfVhf(*(const HVX_Vector *) (d + (size_t) (KT) * rs), ya_[8]);            \
+        HVX_VectorPair s_ = Q6_W_vshuff_VVR(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(p_)), Q6_Vsf_equals_Vqf32(Q6_V_lo_W(p_)), -4); \
+        SA = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(Q6_Vw_vsub_VwVw(Q6_Vw_vadd_VwVw(a0_, a1_), c_)), Q6_V_lo_W(s_));    \
+        SB = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(Q6_Vw_vsub_VwVw(Q6_Vw_vadd_VwVw(b0_, b1_), c_)), Q6_V_hi_W(s_));    \
+    } while (0)
+
+// as tiled_vec_dot_q4_0_gput_rs_64x1, plus corr = hvx_q8_corr_prep of the same activation k-tiles (corr[0] = y_q's)
+static void tiled_vec_dot_q4_0_gput_rs_64x1_c(uint32_t kn, float * restrict out0, float * restrict out1,
+                                              const uint8_t * restrict q, const uint8_t * restrict d, uint32_t rs,
+                                              const uint8_t * restrict y_q, const HVX_Vector * restrict corr,
+                                              uint32_t valid0, uint32_t valid1, const float * acc0, const float * acc1) {
+    const HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
+    HVX_Vector f0 = acc0 ? hvx_vmemu(acc0) : Q6_V_vzero();
+    HVX_Vector f1 = acc1 ? hvx_vmemu(acc1) : Q6_V_vzero();
+    uint32_t kt = 0;
+    for (; kt + 4 <= kn; kt += 4) {
+        HVX_Vector pa[4], pb[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) GPUT_C_KT(kt + u, pa[u], pb[u]);
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+            HVX_Vector xa = pa[u], xb = pb[u];
+            __asm__ volatile("" : "+v"(xa), "+v"(xb));
+            f0 = hvx_vec_add_f32_f32(f0, xa);
+            f1 = hvx_vec_add_f32_f32(f1, xb);
+            __asm__ volatile("" : "+v"(f0), "+v"(f1));
+        }
+    }
+    for (; kt < kn; kt++) {
+        HVX_Vector xa, xb;
+        GPUT_C_KT(kt, xa, xb);
+        __asm__ volatile("" : "+v"(xa), "+v"(xb));
+        f0 = hvx_vec_add_f32_f32(f0, xa);
+        f1 = hvx_vec_add_f32_f32(f1, xb);
+        __asm__ volatile("" : "+v"(f0), "+v"(f1));
+    }
+    hvx_vec_store_u(out0, valid0 * sizeof(float), f0);
+    if (valid1 > 0) {
+        hvx_vec_store_u(out1, valid1 * sizeof(float), f1);
+    }
+}
+#undef GPUT_C_KT
+
 static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
     const uint8_t * restrict tile_ptr = vx;
     const uint8_t * restrict y0_q = vy0;
