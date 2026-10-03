@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
@@ -181,9 +183,52 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
 
+    // The layers from n_layer_kv_from_start on write no KV (they read the cache of earlier layers), so only the rows
+    // that produce an output matter there: keep just those rows from the first of them on. A prompt of n tokens with
+    // one output runs these layers (20 of 35 in E2B, 70 % of the weights) for 1 row instead of n, and a ubatch without
+    // outputs skips them. LLAMA_GEMMA4_STRIP_SHARED=0 turns it off.
+    const int il_strip = hparams.n_layer_kv_from_start;
+    // (not when MTP needs the hidden state of every token: embeddings_nextn without embeddings_nextn_masked)
+    bool strip = inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) && il_strip > 0 && il_strip < n_layer && n_outputs < n_tokens &&
+                 inp_attn->self_kq_mask_cnv && inp_attn->self_kq_mask_cnv->ne[3] == 1 &&
+                 (!inp_attn->self_kq_mask_swa_cnv || inp_attn->self_kq_mask_swa_cnv->ne[3] == 1);
+    {
+        const char * e = getenv("LLAMA_GEMMA4_STRIP_SHARED");
+        if (e && atoi(e) == 0) {
+            strip = false;
+        }
+        for (size_t il = il_strip; strip && il < cparams.embeddings_layer_inp.size(); ++il) {
+            if (cparams.embeddings_layer_inp[il]) {
+                strip = false;  // the input of a stripped layer is asked for over all tokens
+            }
+        }
+    }
+    ggml_tensor * inp_pos_l = inp_pos;
+
     for (int il = 0; il < n_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
+
+        const bool    stripped = strip && il >= il_strip;
+        const int64_t n_tok_l  = stripped ? n_outputs : n_tokens;  // rows of this layer
+        if (strip && il == il_strip) {
+            inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+            cb(inpL, "strip_inp", il);
+            if (n_outputs == 0) {
+                break;
+            }
+            // positions and mask rows of the kept tokens (the masks were filled for all tokens)
+            inp_pos_l = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, inp_pos, 1, inp_pos->ne[0]), inp_out_ids),
+                                        n_outputs);
+            auto strip_mask = [&](ggml_tensor * m) {
+                ggml_tensor * r = ggml_get_rows(ctx0, m, inp_out_ids);
+                return m->type == GGML_TYPE_F32 ? r : ggml_cast(ctx0, r, m->type);
+            };
+            inp_attn->self_kq_mask_cnv = strip_mask(inp_attn->self_kq_mask_cnv);
+            if (inp_attn->self_kq_mask_swa_cnv) {
+                inp_attn->self_kq_mask_swa_cnv = strip_mask(inp_attn->self_kq_mask_swa_cnv);
+            }
+        }
 
         const int64_t n_head    = hparams.n_head(il);
         const int64_t n_head_kv = hparams.n_head_kv(il);
@@ -212,19 +257,19 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
             cb(qkv_fused, "wqkv", il);
             const int64_t q_dim = n_embd_head * n_head;
-            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens, qkv_fused->nb[1], 0));
+            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tok_l, qkv_fused->nb[1], 0));
         } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
         }
         {
             cb(Qcur, "Qcur", il);
 
-            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tok_l);
 
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos_l, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                                  ext_factor, attn_factor, beta_fast, beta_slow);
             cb(Qcur, "Qcur_pos", il);
         }
@@ -238,8 +283,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 const int64_t k_dim = n_embd_head * n_head_kv;
                 const int64_t v_dim = n_embd_head * n_head_kv;
                 const size_t  esize = ggml_element_size(qkv_fused);
-                Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tokens, qkv_fused->nb[1], q_dim * esize));
-                Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tokens, qkv_fused->nb[1], (q_dim + k_dim) * esize));
+                Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tok_l, qkv_fused->nb[1], q_dim * esize));
+                Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tok_l, qkv_fused->nb[1], (q_dim + k_dim) * esize));
             } else {
                 Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
                 Vcur = model.layers[il].wv
@@ -249,8 +294,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tok_l);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tok_l);
 
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
             Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
@@ -258,7 +303,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(Kcur, "Kcur_normed", il);
             cb(Vcur, "Vcur_normed", il);
 
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos_l, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                                  ext_factor, attn_factor, beta_fast, beta_slow);
 
             cb(Kcur, "Kcur_pos", il);
@@ -275,7 +320,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
         // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked && !stripped) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -375,7 +420,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * inp_this_layer = ggml_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
             // TODO @ngxson : improve this
-            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+            if ((il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) || stripped) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
@@ -413,7 +458,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (!cparams.embeddings_nextn_masked && inp_out_ids && !strip) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
